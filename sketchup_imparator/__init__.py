@@ -47,7 +47,7 @@ from .SKPutil import *
 bl_info = {
     "name": "SketchUp Imparator",
     "author": "gurkanerol, Martijn Berger, Sanjay Mehta, Arindam Mondal, Peter Kirkham",
-    "version": (2026, 1, 28),
+    "version": (2026, 1, 37),
     "blender": (5, 1, 0),
     "description": "Import of native SketchUp (.skp) files (The Imparator 2026 Edition)",
     "wiki_url": "https://github.com/gurkanerol/sketchup-imparator",
@@ -577,7 +577,7 @@ class SceneImporter:
             if not MIN_LOGS:
                 print(f"     {name}")
 
-    def write_mesh_data(self, entities=None, name="", default_material="DefaultMaterial", filter_layer=None):
+    def write_mesh_data(self, entities=None, name="", default_material="DefaultMaterial", filter_layer=None, center_geometry=True):
         # Use handle (C-ptr) for unique caching instead of just name
         mesh_key = (entities.handle, default_material, filter_layer)
         if mesh_key in self.component_meshes:
@@ -698,7 +698,7 @@ class SceneImporter:
                         if v.co[i] < b_min[i]: b_min[i] = v.co[i]
                         if v.co[i] > b_max[i]: b_max[i] = v.co[i]
             
-            island_center = (b_min + b_max) / 2.0 if b_min[0] < 1e11 else Vector((0,0,0))
+            island_center = (b_min + b_max) / 2.0 if (b_min[0] < 1e11 and center_geometry) else Vector((0,0,0))
                 
             # Copy geometry to island bmesh (Normalized to island_center)
             vert_map = {}
@@ -893,25 +893,20 @@ class SceneImporter:
         # Container for this level (Skip dummy parents for loose root geometry)
         main_level_ob = None
         if not is_loose_root:
-            # Flatten ALL nested containers aggressively
-            create_pivot = True
-            if parent_ob is not None:
-                create_pivot = False
-                
-            if create_pivot:
-                main_level_ob = bpy.data.objects.new(name, None)
-                main_level_ob.matrix_world = parent_transform
-                target_coll.objects.link(main_level_ob)
-                if parent_ob:
-                    main_level_ob.parent = parent_ob
-                    main_level_ob.matrix_parent_inverse = parent_ob.matrix_world.inverted()
-            else:
-                main_level_ob = parent_ob
+            # ALWAYS create a pivot (Empty) for groups and components to match SKP hierarchy
+            main_level_ob = bpy.data.objects.new(name, None)
+            main_level_ob.empty_display_type = PLAIN_AXES
+            main_level_ob.empty_display_size = 0.1
+            main_level_ob.matrix_world = parent_transform
+            target_coll.objects.link(main_level_ob)
+            if parent_ob:
+                main_level_ob.parent = parent_ob
+                main_level_ob.matrix_parent_inverse = parent_ob.matrix_world.inverted()
 
         # Handle geometry (split into islands)
         if self.organize_by_tags and is_loose_root:
             for l_name in unique_layers:
-                sub_results = self.write_mesh_data(entities=entities, name=f"Loose_{l_name}", default_material=default_material, filter_layer=l_name)
+                sub_results = self.write_mesh_data(entities=entities, name=f"Loose_{l_name}", default_material=default_material, filter_layer=l_name, center_geometry=not is_loose_root)
                 for me, alpha, island_center, mat_name in sub_results:
                     # Clean up material name from Blender suffix if it exists
                     display_name = mat_name.split('.')[0] if '.' in mat_name else mat_name
@@ -932,7 +927,7 @@ class SceneImporter:
                     coll.objects.link(ob)
                     if 0.01 < alpha < 1.0: ob.show_transparent = True
         else:
-            mesh_results = self.write_mesh_data(entities=entities, name=name, default_material=default_material)
+            mesh_results = self.write_mesh_data(entities=entities, name=name, default_material=default_material, center_geometry=not is_loose_root)
             for me, alpha, island_center, mat_name in mesh_results:
                 # Use material name for a more professional outliner list
                 display_name = mat_name.split('.')[0] if '.' in mat_name else mat_name
@@ -992,6 +987,8 @@ class SceneImporter:
         if gname in bpy.data.collections:
             group = bpy.data.collections[gname]
             ob = bpy.data.objects.new(group.name, None)
+            ob.empty_display_type = "PLAIN_AXES"
+            ob.empty_display_size = 0.1
             ob.instance_type = "COLLECTION"
             ob.instance_collection = group
             return ob
@@ -1315,6 +1312,41 @@ class SKP_OT_reload(Operator):
         return {'FINISHED'}
 
 
+
+class SKP_OT_proxy_toggle(Operator):
+    """Toggle between Full Geometry and Bounding Box for SKP data"""
+    bl_idname = "import_scene.skp_proxy_toggle"
+    bl_label = "Toggle Proxy Mode"
+    
+    def execute(self, context):
+        main_coll = bpy.data.collections.get("SKP Imported Data")
+        if not main_coll: return {'CANCELLED'}
+        
+        current_state = 'TEXTURED'
+        for obj in main_coll.all_objects:
+            if obj.type == 'MESH':
+                current_state = obj.display_type
+                break
+        
+        new_state = 'BOUNDS' if current_state != 'BOUNDS' else 'TEXTURED'
+        for obj in main_coll.all_objects:
+            if obj.type == 'MESH':
+                obj.display_type = new_state
+        
+        self.report({'INFO'}, f"Proxy Mode: {'ON' if new_state == 'BOUNDS' else 'OFF'}")
+        return {'FINISHED'}
+
+class SKP_OT_deep_purge(Operator):
+    """Purge all unused data-blocks"""
+    bl_idname = "import_scene.skp_deep_purge"
+    bl_label = "Purge Unused SKP Data"
+    
+    def execute(self, context):
+        for i in range(3):
+            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        self.report({'INFO'}, "Deep Purge complete.")
+        return {'FINISHED'}
+
 class SKP_PT_panel(bpy.types.Panel):
     """Sketchup Imparator Side Panel"""
     bl_label = "SketchUp Imparator"
@@ -1335,8 +1367,13 @@ class SKP_PT_panel(bpy.types.Panel):
             
             col.separator()
             row = col.row()
-            row.scale_y = 1.5
+            row.scale_y = 1.6
             row.operator("import_scene.skp_reload", text="RELOAD / UPDATE SCENE", icon='FILE_REFRESH')
+            
+            layout.label(text="Advanced Tools:")
+            grid = layout.grid_flow(columns=2, align=True)
+            grid.operator("import_scene.skp_proxy_toggle", text="Proxy Mode", icon='GHOST_ENABLED')
+            grid.operator("import_scene.skp_deep_purge", text="Purge", icon='TRASH')
         else:
             col.label(text="No SKP scene imported yet.")
             col.operator("import_scene.skp", text="Import first Sketchup file", icon='IMPORT')
@@ -1351,6 +1388,8 @@ def register():
     
     # New Reload features
     bpy.utils.register_class(SKP_OT_reload)
+    bpy.utils.register_class(SKP_OT_proxy_toggle)
+    bpy.utils.register_class(SKP_OT_deep_purge)
     bpy.utils.register_class(SKP_PT_panel)
     bpy.types.Scene.skp_last_filepath = StringProperty(
         name="Last SKP File",
@@ -1367,6 +1406,8 @@ def unregister():
     
     # New Reload features
     bpy.utils.unregister_class(SKP_OT_reload)
+    bpy.utils.unregister_class(SKP_OT_proxy_toggle)
+    bpy.utils.unregister_class(SKP_OT_deep_purge)
     bpy.utils.unregister_class(SKP_PT_panel)
     del bpy.types.Scene.skp_last_filepath
     

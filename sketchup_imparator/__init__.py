@@ -47,7 +47,7 @@ from .SKPutil import *
 bl_info = {
     "name": "SketchUp Imparator",
     "author": "gurkanerol, Martijn Berger, Sanjay Mehta, Arindam Mondal, Peter Kirkham",
-    "version": (2026, 1, 27),
+    "version": (2026, 1, 28),
     "blender": (5, 1, 0),
     "description": "Import of native SketchUp (.skp) files (The Imparator 2026 Edition)",
     "wiki_url": "https://github.com/gurkanerol/sketchup-imparator",
@@ -1215,6 +1215,12 @@ class ImportSKP(Operator, ImportHelper):
 
     def execute(self, context):
         keywords = self.as_keywords(ignore=("axis_forward", "axis_up", "filter_glob", "split_mode"))
+        # Save settings for reload
+        context.scene.skp_last_filepath = keywords["filepath"]
+        
+        # We don't save all properties here to keep it simple, 
+        # but the filepath is the most important one.
+        
         return SceneImporter().set_filename(keywords["filepath"]).load(context, **keywords)
 
     def draw(self, context):
@@ -1269,12 +1275,88 @@ def menu_func_export(self, context):
     self.layout.operator(ExportSKP.bl_idname, text="SketchUp (.skp)")
 
 
+class SKP_OT_reload(Operator):
+    """Reload the last imported SketchUp file"""
+    bl_idname = "import_scene.skp_reload"
+    bl_label = "Reload / Update Sketchup Scene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        path = context.scene.skp_last_filepath
+        if not path or not os.path.exists(path):
+            self.report({'ERROR'}, "Last imported SketchUp file not found. Please import manually first.")
+            return {'CANCELLED'}
+
+        skp_log(f"Reloading scene from: {path}")
+
+        # Cleanup existing SketchUp collection if it exists
+        main_coll_name = "SKP Imported Data"
+        main_coll = bpy.data.collections.get(main_coll_name)
+        
+        if main_coll:
+            # Delete objects in the collection recursively
+            def delete_coll_obs(coll):
+                for obj in coll.objects:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                for child in coll.children:
+                    delete_coll_obs(child)
+            
+            delete_coll_obs(main_coll)
+            # Remove child collections to ensure fresh hierarchy
+            # But keep the main folders so the UI doesn't flicker too much?
+            # Actually, fresh is better.
+            
+        # Re-trigger import with default settings or stored settings if we had them
+        # For now, we use defaults or just re-import into the same collection.
+        # We call the importer operator without the file dialog.
+        bpy.ops.import_scene.skp(filepath=path)
+        
+        self.report({'INFO'}, f"Reloaded: {os.path.basename(path)}")
+        return {'FINISHED'}
+
+
+class SKP_PT_panel(bpy.types.Panel):
+    """Sketchup Imparator Side Panel"""
+    bl_label = "SketchUp Imparator"
+    bl_idname = "SKP_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Sketchup'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        col = layout.column(align=True)
+        if scene.skp_last_filepath:
+            box = col.box()
+            box.label(text="Last Imported File:", icon='FILEBROWSER')
+            box.label(text=os.path.basename(scene.skp_last_filepath))
+            
+            col.separator()
+            row = col.row()
+            row.scale_y = 1.5
+            row.operator("import_scene.skp_reload", text="RELOAD / UPDATE SCENE", icon='FILE_REFRESH')
+        else:
+            col.label(text="No SKP scene imported yet.")
+            col.operator("import_scene.skp", text="Import first Sketchup file", icon='IMPORT')
+
+
 def register():
     bpy.utils.register_class(SketchupAddonPreferences)
     bpy.utils.register_class(ImportSKP)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.utils.register_class(ExportSKP)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
+    
+    # New Reload features
+    bpy.utils.register_class(SKP_OT_reload)
+    bpy.utils.register_class(SKP_PT_panel)
+    bpy.types.Scene.skp_last_filepath = StringProperty(
+        name="Last SKP File",
+        description="Path to the last imported SketchUp file",
+        default=""
+    )
 
 
 def unregister():
@@ -1282,4 +1364,10 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.utils.unregister_class(ExportSKP)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    
+    # New Reload features
+    bpy.utils.unregister_class(SKP_OT_reload)
+    bpy.utils.unregister_class(SKP_PT_panel)
+    del bpy.types.Scene.skp_last_filepath
+    
     bpy.utils.unregister_class(SketchupAddonPreferences)

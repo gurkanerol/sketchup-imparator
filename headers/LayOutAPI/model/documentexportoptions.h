@@ -1,0 +1,78 @@
+// Copyright 2015-2024 Trimble Inc. All rights reserved.
+// This file is intended for public distribution.
+
+#ifndef LAYOUT_MODEL_DOCUMENTEXPORTOPTIONS_H_
+#define LAYOUT_MODEL_DOCUMENTEXPORTOPTIONS_H_
+
+/**
+@brief Dictionary key to use when specifying the file location for export.
+*/
+const char* const LOExportOption_FileLocation = "lo_export_file_location";
+
+/**
+@brief Dictionary key to use when specifying the start page option for
+       \ref LODocumentExportToPDF or \ref LODocumentExportToImageSet.
+*/
+const char* const LOExportOption_StartPage = "start_page";
+
+/**
+@brief Dictionary key to use when specifying the end page option for
+       \ref LODocumentExportToPDF or \ref LODocumentExportToImageSet.
+*/
+const char* const LOExportOption_EndPage = "end_page";
+
+/**
+@brief Dictionary key to use when specifying the page range option for
+       \ref LODocumentExportToPDF or \ref LODocumentExportToImageSet.
+       The value stored with this key takes precedent over `"start_page"`
+       and `"end_page"`.
+@since LayOut 2024.0, API 9.0
+*/
+const char* const LOExportOption_PageRange = "page_range";
+
+/**
+@brief Dictionary key to use when specifying the page range type option for
+       \ref LODocumentExportToPDF or \ref LODocumentExportToImageSet.
+       If this value is set to \ref LOExportPageRangeType_All, then
+       `"start_page"`, `"end_page"`, and `"page_range"` are ignored. If
+       not set, or set to \ref LOExportPageRangeType_Range, then those
+       values will be used as outlined.
+@since LayOut 2025.0, API 10.0
+*/
+const char* const LOExportOption_PageRangeType = "page_range_type";
+
+/**
+@brief Dictionary values to use for the \ref LOExportOption_PageRangeType key.
+@since LayOut 2025.0, API 10.0
+*/
+const int LOExportPageRangeType_All = 0;
+const int LOExportPageRangeType_Range = 1;
+
+/**
+@brief Dictionary key to use when specifying the output resolution option for
+       \ref LODocumentExportToPDF.
+@deprecated This key is deprecated as of 2023.1. Set the output resolution of
+            images and viewports through the LOPageInfoSetImageOutputResolution
+            and LOPageInfoSetOutputResolution respectively.
+*/
+const char* const LOExportOption_OutputResolution = "output_resolution";
+
+/**
+@brief Dictionary key to use when specifying the compress images option for
+       \ref LODocumentExportToPDF.
+*/
+const char* const LOExportOption_CompressImages = "compress_images";
+
+/**
+@brief Dictionary key to use when specifying the image compression quality
+       option for \ref LODocumentExportToPDF.
+*/
+const char* const LOExportOption_ImageCompressionQuality = "compress_quality";
+
+/**
+@brief Dictionary key to use when specifying the image DPI option for
+       \ref LODocumentExportToImageSet.
+*/
+const char* const LOExportOption_DPI = "dpi";
+
+#endif  // #define LAYOUT_MODEL_DOCUMENTEXPORTOPTIONS_H_

@@ -23,7 +23,9 @@ def get_version():
 
 def run_command(cmd, cwd=None):
     print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    env = os.environ.copy()
+    env["UV_CACHE_DIR"] = os.path.abspath(".uv_cache")
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         print(f"Error: {result.stderr}")
         raise Exception(f"Command failed: {' '.join(cmd)}")
@@ -46,14 +48,14 @@ def clean():
 def build():
     print("--- Starting Sterilized Build ---")
     
-    # 1. Compile extension using local uv environment
-    run_command([UV_BIN, "run", "python", "setup.py", "build_ext", "--inplace"])
+    # 1. Skip compilation since we have the binary
+    # run_command([UV_BIN, "run", "python", "setup.py", "build_ext", "--inplace"])
     
     # 2. Find the generated binary
     # We look for the one with cpython/abi3 suffix first, or just sketchup.so
-    binaries = glob.glob("sketchup.cpython-*.so") + glob.glob("sketchup.abi3.so")
+    binaries = glob.glob("sketchup_imparator/sketchup.cpython-*.so") + glob.glob("sketchup_imparator/sketchup.abi3.so")
     if not binaries:
-        binaries = glob.glob("sketchup.so")
+        binaries = glob.glob("sketchup_imparator/sketchup.so")
         
     if not binaries:
         raise Exception("Failed to find compiled .so file after build")

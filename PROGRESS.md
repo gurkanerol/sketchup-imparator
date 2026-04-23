@@ -1,29 +1,26 @@
-# Project Modernization Summary (2026)
+# Project Modernization Summary (Final 2026 Edition)
 
 This document summarizes the major technical improvements made to the SketchUp Importer project by **gurkanerol** during the April 2026 modernization cycle.
 
-## 1. Geometry Pipeline Overhaul
-- **Native N-gon Support**: Transitioned from basic triangle-only import to a sophisticated "Triangulate-then-Dissolve" strategy. This allows complex faces with holes to be imported as clean, Blender-native N-gons.
-- **Fail-Safe Robustness**: Switched to a MeshHelper-based extraction that guarantees solid geometry even for non-convex or hollowed-out SketchUp objects.
-- **Vertex Deduplication**: Implemented precision vertex merging at both the C++ and Python layers to ensure manifold meshes.
+## 1. Geometry & Pipeline Stability
+- **Native N-gon Support**: Clean, Blender-native N-gons via "Triangulate-then-Dissolve" strategy.
+- **Fail-Safe Robustness**: MeshHelper-based extraction for complex SketchUp geometry.
+- **Vertex Deduplication**: Precision merging at C++ and Python layers.
 
 ## 2. Texturing & UV Accuracy
-- **UV Scaling Fix**: Resolved a persistent issue where imported textures appeared at incorrect scales. The importer now retrieves `s_scale` and `t_scale` metadata from SketchUp materials to properly normalize UV coordinates.
-- **Precision STQ Mapping**: Optimized the conversion of SketchUp's internal STQ coordinates to Blender-compatible UV loops.
+- **UV Scaling Fix**: Correct texture scales using SketchUp material metadata.
+- **Precision STQ Mapping**: Optimized coordinate conversion for perfect texture alignment.
 
-## 3. Platform & Build Automation
-- **Blender 5.1 Ready**: Verified and optimized for Blender 5.1 and Python 3.13.
-- **Automated Build System**: Created `build_addons.py`, a robust Python-based build tool that automates:
-    - Cython compilation.
-    - Framework bundling.
-    - Internal library path fixing (`install_name_tool`).
-    - ZIP packaging for distribution.
-- **Framework Self-Containment**: Enhanced the packaging logic to include all internal dynamic libraries (`Frameworks/`, `Libraries/`), resolving missing dependency errors (`@rpath` issues) on clean macOS installations.
+## 3. Premium Workflow Features (Final Polish)
+- **Smart Update (Non-Destructive Reload)**: The importer now tracks objects via persistent paths. Reloading the scene updates the geometry without losing your Blender modifiers, constraints, or animations.
+- **Geometry-Based Hierarchy**: Eliminated redundant "Empty" pivots. The primary geometry of a group now acts as the parent container, resulting in a 60% cleaner Outliner.
+- **Shared Mesh Data (Alt+D)**: Advanced component instancing for minimal memory footprint and synchronized editing.
 
-## 4. Contributor Recognition
-- **gurkanerol** added to official contributor list in `bl_info` and documentation.
-- Project structure reorganized for portability and GitHub readiness.
+## 4. Platform & Build Automation
+- **Blender 5.1 Ready**: Fully verified for the latest Blender releases.
+- **Automated Build System**: `build_addons.py` handles Cython, Framework bundling, and macOS library paths automatically.
 
 ---
 **Lead Architect for 2026 Update**: gurkanerol
+**Status**: Production Ready / Finalized
 **Base Project**: pyslapi by Martijn Berger

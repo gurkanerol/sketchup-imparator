@@ -690,11 +690,10 @@ cdef class Face:
                 ind = int(i)
                 vertices_list.append((m(vertices[ind].x), m(vertices[ind].y), m(vertices[ind].z)))
             for i in range(got_stq_count):
-                z = stq[i].z
-                if z == 0:
-                    z = 1.0
-                ind = int(i)
-                uv_list.append((stq[ind].x / z * self.s_scale, stq[ind].y / z * self.t_scale))
+                q = stq[i].z
+                if abs(q) < 1e-6: q = 1.0
+                uv_list.append(((stq[i].x / q) * self.s_scale, 
+                                (stq[i].y / q) * self.t_scale))
             triangles_list = []
             for ii in range(index_count // 3):
                 ind = int(ii * 3)
@@ -957,17 +956,17 @@ cdef class Entities:
                             verts.append(pos)
                         tri_indices_list.append(seen[pos])
                         
-                        # Front UVs - Apply inch-to-meter conversion (m()) to match scaled geometry
+                        # Front UVs - STQ to normalized UV conversion (No inch-to-meter here!)
                         q = mesh_stq_front[v_idx].z
                         if abs(q) < 1e-6: q = 1.0
-                        tri_uvs_front.append((round(m(mesh_stq_front[v_idx].x) / (q * s_scale), 6), 
-                                              round(m(mesh_stq_front[v_idx].y) / (q * t_scale), 6)))
+                        tri_uvs_front.append((round((mesh_stq_front[v_idx].x / q) * s_scale, 6), 
+                                              round((mesh_stq_front[v_idx].y / q) * t_scale, 6)))
                                               
-                        # Back UVs - Apply inch-to-meter conversion (m()) to match scaled geometry
+                        # Back UVs - STQ to normalized UV conversion (No inch-to-meter here!)
                         q = mesh_stq_back[v_idx].z
                         if abs(q) < 1e-6: q = 1.0
-                        tri_uvs_back.append((round(m(mesh_stq_back[v_idx].x) / (q * s_scale), 6), 
-                                             round(m(mesh_stq_back[v_idx].y) / (q * t_scale), 6)))
+                        tri_uvs_back.append((round((mesh_stq_back[v_idx].x / q) * s_scale, 6), 
+                                             round((mesh_stq_back[v_idx].y / q) * t_scale, 6)))
                     
                     face_tri_loops.append(tri_indices_list)
                     face_front_uvs.append(tri_uvs_front)

@@ -657,7 +657,7 @@ class SceneImporter:
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         # Dissolve to get cleaner N-gons
-        bmesh.ops.dissolve_limit(bm, angle_limit=0.05, verts=bm.verts, edges=bm.edges)
+        bmesh.ops.dissolve_limit(bm, angle_limit=0.05, verts=bm.verts, edges=bm.edges, delimit={'MATERIAL', 'UV'})
         
         # Identify disconnected islands to allow splitting into separate objects
         islands = []

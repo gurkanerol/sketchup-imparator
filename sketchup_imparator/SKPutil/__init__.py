@@ -61,10 +61,47 @@ def group_safe_name(name):
 
 def inherent_default_mat(mat, default_material):
     mat_name = mat.name if mat else default_material
-    if mat_name == (default_material_name and default_material != default_material_name):
+    if mat_name == default_material_name and default_material != default_material_name:
         mat_name = default_material
 
     return mat_name
+
+
+def clear_import_state(state):
+    """Reset importer-owned caches and runtime state between imports."""
+    for attr in [
+        "component_meshes",
+        "skp_components",
+        "component_depth",
+        "mesh_cache",
+        "materials",
+        "materials_scales",
+        "texture_scales",
+        "name_mapping",
+        "component_skip",
+    ]:
+        if hasattr(state, attr):
+            value = getattr(state, attr)
+            if hasattr(value, "clear"):
+                value.clear()
+
+    if not hasattr(state, "component_skip") or getattr(state, "component_skip") is None:
+        state.component_skip = proxy_dict()
+    else:
+        state.component_skip = proxy_dict(getattr(state, "component_skip", {}))
+
+    state.component_stats = defaultdict(list)
+    state.instance_counts = defaultdict(int)
+    state.group_written = {}
+    state.materials = {}
+    state.materials_scales = {}
+    state.texture_scales = {}
+    state.component_meshes = {}
+    state.mesh_cache = {}
+    state.name_mapping = {}
+    state.component_depth = {}
+    state.skp_components = {}
+    state.layers_skip = []
 
 
 class EntityType(Enum):

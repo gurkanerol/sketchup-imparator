@@ -3,8 +3,12 @@ import os
 import shutil
 import tempfile
 import time
+import gc
 from collections import defaultdict
-
+try:
+    import numpy as np
+except ImportError:
+    np = None
 import bpy
 DEBUG_MODE = True
 import bmesh
@@ -48,7 +52,7 @@ from .SKPutil import *
 bl_info = {
     "name": "SketchUp Imparator",
     "author": "gurkanerol, Martijn Berger, Sanjay Mehta, Arindam Mondal, Peter Kirkham",
-    "version": (2026, 4, 24),
+    "version": (2026, 6, 0, 0),
     "blender": (5, 1, 0),
     "description": "Import of native SketchUp (.skp) files (The Imparator 2026 Edition)",
     "wiki_url": "https://github.com/gurkanerol/sketchup-imparator",
@@ -74,6 +78,12 @@ class SketchupAddonPreferences(AddonPreferences):
     camera_far_plane: FloatProperty(name="Camera Clip Ends At :", default=250, unit="LENGTH")
 
     draw_bounds: IntProperty(name="Draw Similar Objects As Bounds When It's Over :", default=1000)
+    
+    skp_keep_smoothing: BoolProperty(
+        name="Keep Smoothing After Reload",
+        description="Automatically restore 'Smooth by Angle' modifiers during scene updates",
+        default=True
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -85,6 +95,10 @@ class SketchupAddonPreferences(AddonPreferences):
         row = layout.row()
         row.use_property_split = True
         row.prop(self, "draw_bounds")
+        
+        layout.label(text="- Preservation Options -")
+        row = layout.row()
+        row.prop(self, "skp_keep_smoothing")
 
 
 def skp_log(*args):
@@ -93,28 +107,7 @@ def skp_log(*args):
         print("SketchUp Imparator |", *args)
 
 
-def create_nested_collection(coll_name):
-    context = bpy.context
-    main_coll_name = "SKP Imported Data"
 
-    # Ensure main collection exists and is linked
-    main_coll = bpy.data.collections.get(main_coll_name)
-    if not main_coll:
-        main_coll = bpy.data.collections.new(main_coll_name)
-        
-    if main_coll_name not in context.scene.collection.children:
-        context.scene.collection.children.link(main_coll)
-
-    # Ensure nested collection exists and is linked to main
-    nested_coll = bpy.data.collections.get(coll_name)
-    if not nested_coll:
-        nested_coll = bpy.data.collections.new(coll_name)
-        
-    if coll_name not in main_coll.children:
-        main_coll.children.link(nested_coll)
-
-    # Safely set active layer collection for UI focus
-    return nested_coll
 
 
 def get_collection(name, parent):
@@ -126,17 +119,45 @@ def get_collection(name, parent):
     return coll
 
 
-def init_skp_collections():
-    root = get_collection("SKP Imported Data", None)
+def init_skp_collections(filepath):
+    import os
+    base_name = os.path.basename(filepath)
+    root_name = f"SKP: {base_name}"
+    prefix = base_name.split('.')[0] + "_"
+    
+    # 1. Create a single Root Collection for easy visibility toggle
+    root_coll = get_collection(root_name, None)
+    root_coll["skp_filepath"] = filepath
+    root_coll["skp_version"] = "2026.6.0.0"
+
+    # FIX: ROOT Empty removed entirely (no leftover dot at origin).
+    root_empty = None
+
+    # FIX: Collections for outliner bulk grouping (no parent lines).
+    # Groups/components separated in outliner, objects not parented to ROOT.
+    def get_subcoll(name, parent_coll):
+        coll = bpy.data.collections.get(name) or bpy.data.collections.new(name)
+        if name not in parent_coll.children.keys():
+            parent_coll.children.link(coll)
+        return coll
+
+    groups_coll = get_subcoll(prefix + "GROUPS", root_coll)
+    components_coll = get_subcoll(prefix + "COMPONENTS", root_coll)
+    mesh_coll = get_subcoll(prefix + "MESH", root_coll)
+    edges_coll = get_subcoll(prefix + "EDGES", root_coll)
+
     colls = {
-        'root': root,
-        'cameras': get_collection("SKP Scenes (as Cameras)", root),
-        'components': get_collection("SKP Components", root),
-        'groups': get_collection("SKP Groups", root),
-        'mesh': get_collection("SKP Mesh Objects", root),
-        'edges': get_collection("SKP Loose Edges", root),
-        'hidden': get_collection("SKP Hidden Objects", root)
+        'root_coll': root_coll,
+        'root_empty': root_empty,
+        'components_node': components_coll,
+        'groups_node': groups_coll,
+        'mesh_node': mesh_coll,
+        'edges_node': edges_coll,
+        'hidden_node': root_empty  # alias, hidden stays in own type collection
     }
+    return colls
+
+
     # Hide the hidden objects collection in viewport
     pass  # Removed data block hide
     return colls
@@ -144,23 +165,33 @@ def init_skp_collections():
 
 def hide_one_level():
     context = bpy.context
+    if not context.screen:
+        return
 
     outliners = [a for a in context.screen.areas if a.type == "OUTLINER"]
-    c = context.copy()
     for ol in outliners:
-        c["area"] = ol
-        bpy.ops.outliner.show_one_level(c, open=False)
-        ol.tag_redraw()
+        try:
+            with context.temp_override(area=ol):
+                bpy.ops.outliner.show_one_level(open=False)
+            ol.tag_redraw()
+        except Exception:
+            pass
 
     # context.view_layer.update()
 
 
+
+
 class SceneImporter:
     def __init__(self):
-        self.filepath = "/tmp/untitled.skp"
-        self.name_mapping = {}
-        self.layers_skip = []
+        self.skp_model = None
+        self.filepath = ""
+        self.filename_prefix = ""  # Used to isolate data between multiple imports
+        self.materials = {}
+        self.materials_scales = {}
+        self.texture_scales = {}
         self.component_meshes = {}
+        self.group_written = {}
         self.component_stats = defaultdict(list)
         self.instance_counts = defaultdict(int)
         self.max_instance = 50
@@ -170,18 +201,22 @@ class SceneImporter:
         self.basepath, self.skp_filename = os.path.split(self.filepath)
         return self  # allow chaining
 
-    def load(self, context, **options):
+    def load(self, context, is_update=False, **options):
         """Load a SketchUp file"""
+        # 0. Unit Sync: Ensure Blender is in Metric Meters for correct scale
+        context.scene.unit_settings.system = 'METRIC'
+        context.scene.unit_settings.scale_length = 1.0
+        context.scene.unit_settings.length_unit = 'METERS'
+        
         # Blender settings
         self.context = context
-        self.organize_by_tags = options.get("organize_by_tags", False)
         self.import_standalone_edges = options.get("import_standalone_edges", False)
         self.support_back_material = options.get("support_back_material", False)
         self.merge_coplanar_faces = options.get("merge_coplanar_faces", False)
         self.reuse_material = options.get("reuse_material", True)
+        self.smart_pbr = options.get("smart_pbr", True)
         self.reuse_group = options.get("reuse_existing_groups", False)
         self.max_instance = options.get("max_instance", 50)
-        self.tag_collections = {}
         self.component_stats = defaultdict(list)
         self.component_skip = proxy_dict()
         self.component_depth = proxy_dict()
@@ -189,6 +224,9 @@ class SceneImporter:
         ren_res_x = context.scene.render.resolution_x
         ren_res_y = context.scene.render.resolution_y
         self.aspect_ratio = ren_res_x / ren_res_y
+        self.scene = None
+        self.layers_skip = []
+        self.mesh_cache = {} # Cache for component definition meshes (reuse data)
 
         # Start stopwatch for overall import
         _time_main = time.time()
@@ -196,6 +234,11 @@ class SceneImporter:
         # Log filename being imported
         if LOGS:
             skp_log(f"Importing: {self.filepath}")
+        
+        # Set unique prefix for this import session
+        import os
+        self.filename_prefix = os.path.basename(self.filepath).split('.')[0] + "_"
+        
         addon_name = __name__.split(".")[0]
         self.prefs = context.preferences.addons[addon_name].preferences
         
@@ -214,12 +257,55 @@ class SceneImporter:
             except Exception:
                 skp_log("SketchUp API status check skipped.")
 
+            # 1. Initialize Progress Bar and window manager
+            wm = context.window_manager
+            # Convert generator to list to get length for progress bar
+            skp_defs = list(self.skp_model.component_definitions)
+            # Total steps: defs analysis + duplicateable groups + root entities + instancing
+            total_elements = len(skp_defs) * 2 + 5 
+            wm.progress_begin(0, total_elements)
+            self.progress_count = 0
+            
             # Pre-calculate instance counts for optimization decisions
-            for cd in self.skp_model.component_definitions:
+            for i, cd in enumerate(skp_defs):
+                self.progress_count += 1
+                wm.progress_update(self.progress_count)
                 self.instance_counts[cd.name] = cd.numInstances
     
-            # 1. Initialize Standard Collections
-            self.colls = init_skp_collections()
+            # 2. Initialize Standard Collections (now unique per file)
+            self.colls = init_skp_collections(self.filepath)
+
+            # CLEANUP: If this is an update/reload, remove old objects to prevent duplication
+            if is_update:
+                if not MIN_LOGS:
+                    skp_log("Reload detected: Cleaning up old objects...")
+                
+                # List of category nodes to clean
+                categories = ['mesh_node', 'components_node', 'groups_node', 'edges_node', 'hidden_node']
+                for cat_key in categories:
+                    cat_node = self.colls.get(cat_key)
+                    if cat_node:
+                        # Recursively find and delete all child objects
+                        # We do this before the main import loop
+                        children = [obj for obj in bpy.data.objects if obj.parent == cat_node]
+                        for child in children:
+                            # If it's an empty (folder), it might have its own children
+                            # For simplicity and safety, we delete everything parented to category nodes
+                            # In Blender, deleting the object doesn't delete the data-block (mesh), 
+                            # but we'll let Blender's garbage collection handle that.
+                            try:
+                                # Delete recursively (optional but safer for nested empties)
+                                def delete_recursive(ob):
+                                    for c in ob.children:
+                                        delete_recursive(c)
+                                    # Unlink and delete
+                                    for coll in ob.users_collection:
+                                        coll.objects.unlink(ob)
+                                    bpy.data.objects.remove(ob, do_unlink=True)
+                                
+                                delete_recursive(child)
+                            except:
+                                pass
 
             # Start stopwatch for camera import
             if not MIN_LOGS:
@@ -229,11 +315,12 @@ class SceneImporter:
 
             # Import a specific named SketchUp scene as a Blender camera and hide
             # the layers associated with that specific scene
-            if options.get("import_scene"):
-                options["scenes_as_camera"] = False
+            scene_filter = options.get("import_scene_filter")
+            if scene_filter:
+                options["import_scene"] = False # Disable bulk import if specific filter is set
                 options["import_camera"] = True
                 for s in self.skp_model.scenes:
-                    if s.name == options["import_scene"]:
+                    if s.name == scene_filter:
                         if not MIN_LOGS:
                             skp_log(f"Importing named SketchUp scene '{s.name}'")
                         self.scene = s
@@ -241,33 +328,13 @@ class SceneImporter:
                         # Skip s.layers which are the invisible layers
                         self.layers_skip = [l for l in s.layers]
                 if not self.layers_skip and not MIN_LOGS:
-                    skp_log("Scene: '{}' didn't have any invisible layers.".format(options.get("import_scene")))
+                    skp_log("Scene: '{}' didn't have any invisible layers.".format(scene_filter))
                 if self.layers_skip != [] and not MIN_LOGS:
                     hidden_layers = sorted([l.name for l in self.layers_skip])
                     print("SU | Invisible Layer(s)/Tag(s): \n     ", end="")
                     print(*hidden_layers, sep=", ")
 
-            # Import each scene as a Blender camera
-            if options.get("scenes_as_camera"):
-                if not MIN_LOGS:
-                    skp_log("Importing all SketchUp scenes as Blender cameras")
-                for s in self.skp_model.scenes:
-                    name = self.write_camera(s.camera, s.name)
-
-            # Set the active camera and use for 3D view
-            if options.get("import_camera"):
-                if not MIN_LOGS:
-                    skp_log("Importing last SketchUp view as Blender camera")
-                if self.scene:
-                    active_cam = self.write_camera(self.scene.camera, name=self.scene.name)
-                    context.scene.camera = bpy.data.objects[active_cam]
-                else:
-                    active_cam = self.write_camera(self.skp_model.camera)
-                    context.scene.camera = bpy.data.objects[active_cam]
-                for area in bpy.context.screen.areas:
-                    if area.type == "VIEW_3D":
-                        area.spaces[0].region_3d.view_perspective = "CAMERA"
-                        break
+            # Camera and Scene import disabled per user request to preserve Blender camera settings
             SKP_util.layers_skip = self.layers_skip
             if not MIN_LOGS:
                 skp_log(f"Cameras imported in {(time.time() - _time_camera):.4f} sec.")
@@ -291,16 +358,6 @@ class SceneImporter:
 
             # Create collection for components
 
-            # Create collections for Tags inside SKP Mesh Objects if requested
-            if self.organize_by_tags:
-                mesh_coll = self.colls['mesh']
-                for layer in self.skp_model.layers:
-                    name = layer.name
-                    if name not in bpy.data.collections:
-                        l_coll = bpy.data.collections.new(name)
-                        mesh_coll.children.link(l_coll)
-                    self.tag_collections[name] = bpy.data.collections[name]
-
             # Determine the number of components that exist in the SketchUp model
             self.skp_components = proxy_dict(self.skp_model.component_definition_as_dict)
             u_comps = [k for k, v in self.skp_components.items()]
@@ -318,8 +375,12 @@ class SceneImporter:
             if not MIN_LOGS:
                 skp_log(f"Component depths analyzed in {(time.time() - _time_analyze_depth):.4f} sec.")
 
-            # Import the components as duplicated groups then hide components
-            self.write_duplicateable_groups()
+            # Final pass: Ensure everything is parented correctly and visibility is set
+            # (Visibility overrides removed per user request)
+            pass
+
+
+
         
             pass # Visibility overrides removed per user request
 
@@ -338,29 +399,62 @@ class SceneImporter:
 
             # 3. LOOSE ENTITIES (Geometry at root)
             self.write_entities(self.skp_model.entities, "SKP Mesh Objects", Matrix.Identity(4))
-        
+            
             # Import standalone edges if requested
             if self.import_standalone_edges:
                 self.write_standalone_edges(self.skp_model.entities, "Loose Edges", Matrix.Identity(4))
 
-            # Direct recursive import already handled everything via Alt+D mesh sharing
+            # 4. INSTANCING: Process analyzed component statistics
+            inst_len = len(self.component_stats)
+            for i, (k, _v) in enumerate(self.component_stats.items()):
+                self.progress_count += 1
+                wm.progress_update(self.progress_count)
+                name, mat = k
+                if options.get("dedub_type") == "VERTEX":
+                    self.instance_group_dupli_vert(name, mat, self.component_stats)
+                else:
+                    self.instance_group_dupli_face(name, mat, self.component_stats)
+
             if LOGS:
-                skp_log("Finished entire importing process in %.4f sec.\n" % (time.time() - _time_main))
+                duration = time.time() - _time_main
+                summary = f"Import Finished: {len(self.materials)} Mats, {len(self.component_meshes)} Components in {duration:.2f}s"
+                skp_log(summary)
+                self.context.workspace.status_text_set(summary)
+            
+            # End Progress Bar
+            wm.progress_end()
+            
+            # 5. AUTO FOCUS: Zoom to the imported model
+            if not options.get("is_update"):
+                try:
+                    for area in context.screen.areas:
+                        if area.type == 'VIEW_3D' and area.regions:
+                            with context.temp_override(
+                                window=context.window,
+                                area=area,
+                                region=area.regions[-1],
+                            ):
+                                bpy.ops.view3d.view_all(center=True)
+                except: pass
         
         finally:
-            # STERILIZATION: Force C-API destruction and clear RAM caches to prevent leaks.
+            # STERILIZATION: Force C-API destruction to prevent RAM leaks.
             if hasattr(self, "skp_model") and self.skp_model:
-                try: self.skp_model.close()
-                except: pass
+                try:
+                    self.skp_model.close()
+                except Exception:
+                    pass
                 self.skp_model = None
             
-            # Massive memory purge
-            for attr in ["skp_meshes", "skp_components", "component_meshes", "component_depth", "tag_collections"]:
-                if hasattr(self, attr):
-                    getattr(self, attr).clear()
+            # Purge massive memory caches and trigger garbage collection
+            clear_import_state(self)
             
             import gc
             gc.collect()
+            try:
+                bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+            except Exception:
+                pass
             
             if LOGS:
                 skp_log("Memory sterilized and caches cleared.\n")
@@ -457,131 +551,253 @@ class SceneImporter:
     #
     # Import materials from SketchUp into Blender.
     #
+    def _find_existing_material(self, original_name):
+        if not original_name: return None
+        
+        # 1. Clean the name (SketchUp often has trailing spaces)
+        search_name = original_name.strip()
+        search_lower = search_name.lower()
+        
+        # 2. Search by custom property (The most reliable way)
+        for m in bpy.data.materials:
+            if m.get("skp_name") == search_name:
+                return m
+        
+        # 3. Case-insensitive name search (Handles "Bamboo" vs "bamboo")
+        for m in bpy.data.materials:
+            if m.name.lower() == search_lower:
+                m["skp_name"] = search_name # Tag it for next time
+                return m
+        
+        # 4. Handle sanitized colons (Blender replaces : with _)
+        if ":" in search_name:
+            sanitized = search_name.replace(":", "_").lower()
+            for m in bpy.data.materials:
+                if m.name.lower() == sanitized:
+                    m["skp_name"] = search_name
+                    return m
+                    
+        return None
+
+    def write_image(self, tex):
+        import tempfile
+        try:
+            # Sanitize filename (basename only, no path traversal)
+            tex_filename = os.path.basename(tex.name.replace("\\", "/"))
+            if not tex_filename: tex_filename = "texture.png"
+            suffix = os.path.splitext(tex_filename)[1] or ".png"
+
+            # Secure unique temp file (no predictable-path symlink race)
+            fd, temp_path = tempfile.mkstemp(prefix=self.filename_prefix, suffix=suffix)
+            os.close(fd)
+
+            # Write SketchUp texture to disk
+            tex.write(temp_path)
+
+            # Load into Blender
+            img = bpy.data.images.load(temp_path, check_existing=True)
+            img.name = os.path.basename(temp_path)
+            return img
+        except Exception as e:
+            skp_log(f"Failed to write texture {tex.name}: {e}")
+            return None
+
     def write_materials(self, materials):
-        if self.context.scene.render.engine != "CYCLES":
-            self.context.scene.render.engine = "CYCLES"
         self.materials = {}
         self.materials_scales = {}
-        # Improved DefaultMaterial handling to prevent .001 duplication
-        default_name = "DefaultMaterial"
-        existing_default = bpy.data.materials.get(default_name)
+        if not hasattr(self, "texture_scales"):
+            self.texture_scales = {}
+        prefix = self.filename_prefix
         
-        if self.reuse_material and existing_default:
-            self.materials[default_name] = existing_default
-        else:
-            bmat = existing_default if existing_default else bpy.data.materials.new(default_name)
-            bmat.use_nodes = True
-            if bmat.node_tree: bmat.node_tree.nodes.clear()
-            
-            nodes = bmat.node_tree.nodes
-            links = bmat.node_tree.links
-            output_shader = nodes.new("ShaderNodeOutputMaterial")
-            principled_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-            links.new(principled_bsdf.outputs[0], output_shader.inputs["Surface"])
-            principled_bsdf.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-            self.materials[default_name] = bmat
-        for mat in materials:
-            name = mat.name
-            if mat.texture:
-                self.materials_scales[name] = mat.texture.dimensions[2:]
-            else:
-                self.materials_scales[name] = (1.0, 1.0)
-                
-            # Material Persistence & Reuse Logic
-            existing_mat = bpy.data.materials.get(name)
-            
-            if self.reuse_material and existing_mat:
-                self.materials[name] = existing_mat
-                continue
+        # 1. Helper for color conversion
+        def srgb_to_line(c):
+            return pow(c / 255.0, 2.2)
 
-            if existing_mat:
-                bmat = existing_mat
-            else:
-                bmat = bpy.data.materials.new(name)
+        # 2. Default Material (Essential for SketchUp)
+        def_mat_name = "DefaultMaterial"
+        full_def_name = prefix + def_mat_name
+        bmat_def = bpy.data.materials.get(full_def_name)
+        if not bmat_def:
+            bmat_def = bpy.data.materials.new(full_def_name)
+            bmat_def.use_nodes = True
+            bmat_def.node_tree.nodes.clear()
+            out = bmat_def.node_tree.nodes.new("ShaderNodeOutputMaterial")
+            bsdf = bmat_def.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+            bmat_def.node_tree.links.new(bsdf.outputs[0], out.inputs[0])
+            bsdf.inputs["Base Color"].default_value = (0.8, 0.8, 0.8, 1.0)
+        
+        self.materials[def_mat_name] = bmat_def
+        self.materials_scales[def_mat_name] = (1.0, 1.0)
 
-            r, g, b, a = mat.color
-            tex = mat.texture
-            # Convert sRGB to Linear
-            bmat.diffuse_color = (
-                math.pow((r / 255.0), 2.2),
-                math.pow((g / 255.0), 2.2),
-                math.pow((b / 255.0), 2.2),
-                round((a / 255.0), 2),
-            )
+        # 3. Process all other materials
+        for m in materials:
+            name = m.name
+            full_name = prefix + name
 
-            if round((a / 255.0), 2) < 1:
-                bmat.blend_method = "BLEND"
-            else:
-                bmat.blend_method = "OPAQUE"
-                
-            bmat.use_nodes = True
-            if bmat.node_tree:
-                bmat.node_tree.nodes.clear()
-            else:
-                bmat.use_nodes = True # Re-init if node tree was missing
+            # Record SketchUp texture scale for inherited UV fix
+            # (sketchup.pyx only multiplies inherited faces by this).
+            try:
+                _t = m.texture
+                if _t and not isinstance(_t, bool):
+                    _d = _t.dimensions
+                    self.texture_scales[name] = (float(_d[2]), float(_d[3]))
+            except Exception:
+                pass
+
+            # Use existing if found
+            bmat = bpy.data.materials.get(full_name)
+            if bmat and self.reuse_material:
+                self.materials[name] = bmat
+                # Skip recreation of nodes if user already has this material
+                continue 
+
+            if not bmat:
+                bmat = bpy.data.materials.new(full_name)
+                bmat.use_nodes = True
             
-            nodes = bmat.node_tree.nodes
-            links = bmat.node_tree.links
-            
-            output_shader = nodes.new("ShaderNodeOutputMaterial")
-            principled_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-            links.new(principled_bsdf.outputs[0], output_shader.inputs["Surface"])
-            
-            principled_bsdf.inputs["Base Color"].default_value = bmat.diffuse_color
-            principled_bsdf.inputs["Alpha"].default_value = bmat.diffuse_color[3]
-            
-            if tex:
-                try:
-                    raw_tex_name = tex.name.replace("\\", "/")
-                    tex_filename = raw_tex_name.split("/")[-1]
-                    for char in '<>:"/\\|?*':
-                        tex_filename = tex_filename.replace(char, "_")
-                    
-                    if not tex_filename: tex_filename = f"Texture_{name}.jpg"
-                        
-                    temp_dir = os.path.join(tempfile.gettempdir(), f"skp_tex_{int(time.time())}")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    temp_file_path = os.path.join(temp_dir, tex_filename)
-                    
-                    tex.write(temp_file_path)
-                    
-                    # Avoid reloading images if already in Blender and we want clean updates
-                    img_name = f"{name}_{tex_filename}"
-                    img = bpy.data.images.get(img_name) or bpy.data.images.load(temp_file_path)
-                    img.name = img_name
-                    img.pack()
-                    shutil.rmtree(temp_dir)
-                    
-                    tex_node = nodes.new("ShaderNodeTexImage")
-                    tex_node.image = img
-                    tex_node.location = Vector((-600, 0))
-                    
-                    tex_coord = nodes.new("ShaderNodeTexCoord")
-                    mapping = nodes.new("ShaderNodeMapping")
-                    
-                    links.new(tex_coord.outputs["UV"], mapping.inputs["Vector"])
-                    links.new(mapping.outputs["Vector"], tex_node.inputs["Vector"])
-                    links.new(tex_node.outputs["Color"], principled_bsdf.inputs["Base Color"])
-                    
-                    if img.file_format in ("PNG", "TARGA") or bmat.diffuse_color[3] < 1.0:
-                        links.new(tex_node.outputs["Alpha"], principled_bsdf.inputs["Alpha"])
-                        bmat.blend_method = 'HASHED'
-                        if hasattr(bmat, "shadow_method"): bmat.shadow_method = 'HASHED'
-                except Exception as e:
-                    skp_log(f"Texture error for {name}: {e}")
-            
+            bmat["skp_imported"] = True # Stability tag
             self.materials[name] = bmat
+            # 3. Shader Node Construction (Organized Layout)
+            nodes = bmat.node_tree.nodes
+            links = bmat.node_tree.links
+            nodes.clear()
+            
+            # Position variables for a clean UI
+            x_pos = -800
+            
+            # 3. Shader Node Construction
+            node_tex = None
+            tex = m.texture
+            if tex:
+                img = self.write_image(tex)
+                if img:
+                    # Create Tiling Nodes only if there is a texture
+                    node_tex_coord = nodes.new("ShaderNodeTexCoord")
+                    node_tex_coord.location = (x_pos, 0)
+                    x_pos += 250
+                    
+                    node_mapping = nodes.new("ShaderNodeMapping")
+                    node_mapping.location = (x_pos, 0)
+                    x_pos += 300
+                    
+                    node_tex = nodes.new("ShaderNodeTexImage")
+                    node_tex.image = img
+                    node_tex.location = (x_pos, 0)
+                    x_pos += 300
+                    
+                    # FIX: STQ/Q already contains tile counts. Mapping must be
+                    # identity (1,1,1). Previously s_scale/0.0254 double-scaled
+                    # UVs -> textures 10-1000x too big or too small.
+                    node_mapping.inputs["Scale"].default_value[0] = 1.0
+                    node_mapping.inputs["Scale"].default_value[1] = 1.0
+                    node_mapping.inputs["Scale"].default_value[2] = 1.0
+                    node_mapping.inputs["Location"].default_value[0] = 0.0
+                    node_mapping.inputs["Location"].default_value[1] = 0.0
+                    node_mapping.inputs["Location"].default_value[2] = 0.0
 
-    def write_mesh_data(self, entities=None, name="", default_material="DefaultMaterial", filter_layer=None, center_geometry=True, cache_id=None):
+
+
+
+
+
+
+                    
+                    # Link Tiling Nodes
+                    links.new(node_tex_coord.outputs["UV"], node_mapping.inputs["Vector"])
+                    links.new(node_mapping.outputs["Vector"], node_tex.inputs["Vector"])
+
+            node_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+            node_bsdf.location = (x_pos, 0)
+            x_pos += 350
+            
+            node_output = nodes.new("ShaderNodeOutputMaterial")
+            node_output.location = (x_pos, 0)
+            
+            # 4. Final Linking and Color Logic
+            try:
+                c = m.color
+                r, g, b, a = c[0], c[1], c[2], c[3]
+                alpha = a / 255.0
+                base_color = (srgb_to_line(r), srgb_to_line(g), srgb_to_line(b), 1.0)
+                
+                if node_tex:
+                    links.new(node_tex.outputs["Color"], node_bsdf.inputs["Base Color"])
+                    if alpha < 0.99 or node_tex.image.depth == 32:
+                        links.new(node_tex.outputs["Alpha"], node_bsdf.inputs["Alpha"])
+                        bmat.blend_method = 'HASHED'
+                else:
+                    node_bsdf.inputs["Base Color"].default_value = base_color
+                    node_bsdf.inputs["Alpha"].default_value = alpha
+                    bmat.blend_method = 'HASHED' if alpha < 0.99 else 'OPAQUE'
+            except:
+                node_bsdf.inputs["Base Color"].default_value = (0.8, 0.8, 0.8, 1.0)
+            
+            links.new(node_bsdf.outputs[0], node_output.inputs[0])
+
+            
+            # 5. Smart PBR Heuristics
+            if self.smart_pbr:
+                self._apply_smart_pbr(bmat, name)
+
+
+    def _apply_smart_pbr(self, bmat, name):
+        """Helper to apply Smart PBR heuristics to a Blender material based on SketchUp names"""
+        if not bmat or not bmat.use_nodes: return
+        nodes = bmat.node_tree.nodes
+        bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if not bsdf: return
+        
+        mat_lower = name.lower()
+        
+        # 1. Glass / Cam Heuristics
+        if "glass" in mat_lower or "cam" in mat_lower:
+            bsdf.inputs["Transmission Weight"].default_value = 1.0
+            bsdf.inputs["Roughness"].default_value = 0.02
+            bsdf.inputs["IOR"].default_value = 1.45 # Standard Glass
+            bmat.blend_method = 'BLEND' # Better for architectural glass
+            
+        # 2. Metal / Steel / Celik
+        elif "metal" in mat_lower or "steel" in mat_lower or "celik" in mat_lower or "gold" in mat_lower:
+            bsdf.inputs["Metallic"].default_value = 1.0
+            bsdf.inputs["Roughness"].default_value = 0.15
+            
+        # 3. Mirror / Ayna
+        elif "mirror" in mat_lower or "ayna" in mat_lower:
+            bsdf.inputs["Metallic"].default_value = 1.0
+            bsdf.inputs["Roughness"].default_value = 0.0
+            bsdf.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+            
+        # 4. Water / Su
+        elif "water" in mat_lower or "su" in mat_lower:
+            bsdf.inputs["Transmission Weight"].default_value = 1.0
+            bsdf.inputs["Roughness"].default_value = 0.01
+            bsdf.inputs["IOR"].default_value = 1.33 # Water
+            bmat.blend_method = 'BLEND'
+        
+        # Default fallback for others
+        else:
+            if bsdf.inputs["Alpha"].default_value < 1.0:
+                bmat.blend_method = 'HASHED'
+
+
+    def write_mesh_data(self, entities=None, name="", default_material="DefaultMaterial", filter_layer=None, center_geometry=True, cache_id=None, parent_node=None, **kwargs):
+        # Prefix mesh name with filename to prevent global collision
+        full_name = self.filename_prefix + name
+        
         # Use explicit cache_id (Definition Name) for stable mesh sharing
         if cache_id:
-            mesh_key = (cache_id, default_material, filter_layer)
+            mesh_key = (self.filename_prefix + cache_id, default_material, filter_layer)
             if mesh_key in self.component_meshes:
                 return self.component_meshes[mesh_key]
 
-        # Attempt to use binary N-gon method, fallback to Python reconstruction if missing or incompatible
+        # Use binary N-gon method for maximum performance, fallback to Python if needed
+        # Pass inherited texture scales so Cython scales only inherited faces.
+        _scales = getattr(self, "texture_scales", None)
         try:
-            verts, raw_faces_data, mats = entities.get_textured_ngon_lists(default_material)
+            try:
+                verts, raw_faces_data, mats = entities.get_textured_ngon_lists(default_material, _scales)
+            except TypeError:
+                verts, raw_faces_data, mats = entities.get_textured_ngon_lists(default_material)
         except Exception as e:
             if LOGS: skp_log(f"Binary call failed or incompatible ({e}), using robust Python fallback...")
             verts, raw_faces_data, mats = self._get_ngon_lists_fallback(entities, default_material)
@@ -593,169 +809,134 @@ class SceneImporter:
         if not verts or not raw_faces_data:
             return []
 
-        me = bpy.data.meshes.new(name)
+        # FIX: Keep SketchUp local coordinates. Previous bbox-centering moved
+        # every mesh origin to its bbox center (often the import center).
+        # SketchUp origin = group/component origin (= parent_transform).
+        island_center = Vector((0,0,0))
+
+        me = bpy.data.meshes.new(full_name)
         
-        # Optimize material access
-        mats_data = bpy.data.materials
-        mats_get = mats_data.get
-        
-        # Add materials to the mesh
+        # Add materials to the mesh using a pre-calculated mapping
+        slot_map = {}
         if mats:
-            for mat_name, mat_idx in sorted(mats.items(), key=lambda x: x[1]):
-                m = mats_get(mat_name)
+            # Sort materials by their index to ensure slot order matches binary data
+            sorted_mats = sorted(mats.items(), key=lambda x: x[1])
+            for mat_name, mat_idx in sorted_mats:
+                m = self.materials.get(mat_name) or self._find_existing_material(mat_name)
+                
                 if not m:
-                    # Fallback to default if missing
-                    m = self.materials.get("DefaultMaterial")
+                    skp_log(f"Recovering missing material: {mat_name}")
+                    m = bpy.data.materials.new(name=self.filename_prefix + mat_name if mat_name else "Safe_Material")
+                    m["skp_name"] = mat_name
+                    m["skp_imported"] = True
+                    m.use_nodes = True
+                    # Initialize basic nodes for the recovered material
+                    m.node_tree.nodes.clear()
+                    out = m.node_tree.nodes.new("ShaderNodeOutputMaterial")
+                    bsdf = m.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+                    m.node_tree.links.new(bsdf.outputs[0], out.inputs[0])
+                    self.materials[mat_name] = m
+                    
                 me.materials.append(m)
+                slot_map[mat_name] = len(me.materials) - 1
+        
+        # Default material fallback index
+        def_mat = self.materials.get("DefaultMaterial")
+        def_mat_idx = -1
+        if def_mat:
+            if def_mat.name not in [m.name for m in me.materials if m]:
+                me.materials.append(def_mat)
+            for i, m in enumerate(me.materials):
+                if m == def_mat:
+                    def_mat_idx = i
+                    break
+
 
         bm = bmesh.new()
-        bm_verts = [bm.verts.new(v) for v in verts]
-        bm.verts.ensure_lookup_table()
-        
-        for face_info in raw_faces_data:
-            mat_idx = face_info['mat_idx']
-            loops = face_info['loops']
-            front_uvs = face_info['front_uvs']
-            back_mat_idx = face_info['back_mat_idx']
-            back_uvs = face_info['back_uvs']
+        try:
+            bm_verts = [bm.verts.new(v) for v in verts]
+            bm.verts.ensure_lookup_table()
             
-            # Check for dual material if supported
-            final_mat_idx = mat_idx
-            if self.support_back_material and back_mat_idx != -1 and mat_idx != back_mat_idx:
-                front_name = material_names[mat_idx]
-                back_name = material_names[back_mat_idx]
-                dual_name = f"Dual: {front_name} | {back_name}"
-                
-                if dual_name not in self.materials:
-                    self.materials[dual_name] = self.create_dual_material(dual_name, front_name, back_name)
-                
-                d_mat = self.materials[dual_name]
-                # Find dual mat index in me.materials
-                found_dual = False
-                for i, m in enumerate(me.materials):
-                    if m == d_mat:
-                        final_mat_idx = i
-                        found_dual = True
-                        break
-                if not found_dual:
-                    final_mat_idx = len(me.materials)
-                    me.materials.append(d_mat)
+            # Create a lookup list for material names by index
+            material_names = [None] * len(mats)
+            for m_name, m_idx in mats.items():
+                material_names[m_idx] = m_name
             
-            for l_idx, l_verts_indices in enumerate(loops):
-                try:
-                    l_verts = [bm_verts[i] for i in l_verts_indices]
-                    face = bm.faces.new(l_verts)
-                    face.material_index = final_mat_idx
-                    face.smooth = False
-                    
-                    # UV Handling - Use standard name 'UVMap'
-                    uv_layer = bm.loops.layers.uv.get("UVMap") or bm.loops.layers.uv.new("UVMap")
-                    tri_uvs = front_uvs[l_idx]
-                    for loop_vert_idx, loop in enumerate(face.loops):
-                        loop[uv_layer].uv = tri_uvs[loop_vert_idx]
+            for face_info in raw_faces_data:
+                mat_idx = face_info['mat_idx']
+                loops = face_info['loops']
+                front_uvs = face_info['front_uvs']
+                back_mat_idx = face_info['back_mat_idx']
+                back_uvs = face_info['back_uvs']
+                
+                # Front-Face Only Strategy:
+                # We ignore back-face materials to keep the material list clean and slots independent.
+                # If a user wants different colors on two sides of a wall, they should model with thickness.
+                
+                # Get pre-calculated material index
+                m_name = material_names[mat_idx] if mat_idx != -1 else "DefaultMaterial"
+                f_me_idx = slot_map.get(m_name, def_mat_idx)
+
+                for l_idx, l_verts_indices in enumerate(loops):
+                    try:
+                        if len(l_verts_indices) < 3: continue
                         
-                    if self.support_back_material and back_uvs:
-                        uv_back_layer = bm.loops.layers.uv.get("UVBack") or bm.loops.layers.uv.new("UVBack")
-                        tri_back_uvs = back_uvs[l_idx]
+                        unique_indices = []
+                        seen_idx = set()
+                        for i in l_verts_indices:
+                            if i not in seen_idx:
+                                unique_indices.append(i)
+                                seen_idx.add(i)
+                        if len(unique_indices) < 3: continue
+                        
+                        l_verts = [bm_verts[i] for i in unique_indices]
+                        
+                        # Create only the front face
+                        face = bm.faces.new(l_verts)
+                        face.material_index = f_me_idx
+                        face.smooth = False
+                        
+                        uv_layer = bm.loops.layers.uv.get("UVMap") or bm.loops.layers.uv.new("UVMap")
+                        tri_uvs = front_uvs[l_idx]
                         for loop_vert_idx, loop in enumerate(face.loops):
-                            loop[uv_back_layer].uv = tri_back_uvs[loop_vert_idx]
-                except Exception:
-                    pass
+                            if loop_vert_idx < len(tri_uvs):
+                                loop[uv_layer].uv = tri_uvs[loop_vert_idx]
+                    except Exception:
+                        pass
 
-        # Restore UV-safe dissolution to ensure G-non (N-gon) cleanliness
-        # By using delimit={'UV', 'MATERIAL'}, we ensure textures stay perfectly mapped.
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-        bmesh.ops.dissolve_limit(bm, angle_limit=0.001, verts=bm.verts, edges=bm.edges, delimit={'MATERIAL', 'UV'})
+            # Restore UV-safe dissolution to ensure G-non (N-gon) cleanliness
+            # By using delimit={'UV', 'MATERIAL'}, we ensure textures stay perfectly mapped.
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+            bmesh.ops.dissolve_limit(bm, angle_limit=0.001, verts=bm.verts, edges=bm.edges, delimit={'MATERIAL', 'UV'})
+
+            # Consolidate all geometry into a single mesh for maximum performance
+            # Use the mesh 'me' already created and populated with materials at the start of write_mesh_data
+            bm.to_mesh(me)
+        finally:
+            bm.free()
         
-        # Identify disconnected islands to allow splitting into separate objects
-        islands = []
-        unvisited_faces = set(bm.faces)
-        while unvisited_faces:
-            start_face = unvisited_faces.pop()
-            island = {start_face}
-            stack = [start_face]
-            while stack:
-                face = stack.pop()
-                for edge in face.edges:
-                    for other_face in edge.link_faces:
-                        if other_face in unvisited_faces:
-                            unvisited_faces.remove(other_face)
-                            island.add(other_face)
-                            stack.append(other_face)
-            islands.append(island)
-
-        results = [] # List of (mesh, alpha, center, dominant_mat_name)
-        for idx, island_faces in enumerate(islands):
-            island_bm = bmesh.new()
-            island_me = bpy.data.meshes.new(f"{name}_part_{idx}")
+        # Ensure UV layers are active
+        if "UVMap" in me.uv_layers:
+            me.uv_layers.active = me.uv_layers["UVMap"]
             
-            # Identify only the materials used in this specific island
-            used_mat_indices = sorted(list(set(f.material_index for f in island_faces)))
-            old_to_new_mat = {old_idx: new_idx for new_idx, old_idx in enumerate(used_mat_indices)}
-            
-            # Map used materials to the new island mesh slots
-            for old_idx in used_mat_indices:
-                if old_idx < len(me.materials):
-                    island_me.materials.append(me.materials[old_idx])
-
-            # Centering: Use Bounding Box center for the local pivot
-            b_min = Vector((1e12, 1e12, 1e12))
-            b_max = Vector((-1e12, -1e12, -1e12))
-            for f in island_faces:
-                for v in f.verts:
-                    for i in range(3):
-                        if v.co[i] < b_min[i]: b_min[i] = v.co[i]
-                        if v.co[i] > b_max[i]: b_max[i] = v.co[i]
-            
-            island_center = (b_min + b_max) / 2.0 if (b_min[0] < 1e11 and center_geometry) else Vector((0,0,0))
-                
-            # Copy geometry to island bmesh (Normalized to island_center)
-            vert_map = {}
-            for f in island_faces:
-                new_verts = []
-                for v in f.verts:
-                    if v not in vert_map:
-                        nv = island_bm.verts.new(v.co - island_center)
-                        vert_map[v] = nv
-                    new_verts.append(vert_map[v])
-                
-                try:
-                    nf = island_bm.faces.new(new_verts)
-                    nf.material_index = old_to_new_mat[f.material_index]
-                    nf.smooth = f.smooth
-                    
-                    for l_type_name in bm.loops.layers.uv.keys():
-                        old_lay = bm.loops.layers.uv[l_type_name]
-                        new_lay = island_bm.loops.layers.uv.get(l_type_name) or island_bm.loops.layers.uv.new(l_type_name)
-                        for old_loop, new_loop in zip(f.loops, nf.loops):
-                            new_loop[new_lay].uv = old_loop[old_lay].uv
-                except Exception:
-                    pass
-
-            island_bm.to_mesh(island_me)
-            if "UVMap" in island_me.uv_layers:
-                island_me.uv_layers.active = island_me.uv_layers["UVMap"]
-            
-            island_me.update()
-            island_me.validate()
-            
-            has_alpha = any(m.blend_method != 'OPAQUE' for m in island_me.materials if m)
-            
-            dominant_mat_name = "Mesh"
-            if island_me.materials:
-                from collections import Counter
-                mat_counts = Counter(f.material_index for f in island_bm.faces)
-                if mat_counts:
-                    mode_idx = mat_counts.most_common(1)[0][0]
-                    if mode_idx < len(island_me.materials):
-                        m = island_me.materials[mode_idx]
-                        if m: dominant_mat_name = m.name
-            
-            results.append((island_me, has_alpha, island_center, dominant_mat_name))
-            island_bm.free()
+        me.update()
         
-        bm.free()
-        bpy.data.meshes.remove(me)
+        # Determine if the mesh has any transparent materials
+        has_alpha = any(m.blend_method != 'OPAQUE' for m in me.materials if m)
+        
+        # Get dominant material name for object naming
+        dominant_mat_name = "Mesh"
+        if me.materials:
+            from collections import Counter
+            mat_counts = Counter(f.material_index for f in me.polygons)
+            if mat_counts:
+                mode_idx = mat_counts.most_common(1)[0][0]
+                if mode_idx < len(me.materials):
+                    m = me.materials[mode_idx]
+                    if m: dominant_mat_name = m.name
+        
+        results = [(me, has_alpha, island_center, dominant_mat_name)]
+        
         if cache_id:
             self.component_meshes[mesh_key] = results
         return results
@@ -770,7 +951,7 @@ class SceneImporter:
         try:
             # entities.faces can be a generator
             # Python Fallback: Reverting to the stable triangulation + dissolve method
-            for f in list(entities.faces):
+            for f in entities.faces:
                 try:
                     f_verts, f_tris, f_uvs = f.tessfaces
                     if not f_verts or not f_tris: continue
@@ -795,11 +976,23 @@ class SceneImporter:
                         mats[mat_f_name] = len(mats)
                     mat_f_idx = mats[mat_f_name]
 
+                    # FIX: tessfaces returns S/Q. Apply scale only for inherited faces.
+                    _s, _t = 1.0, 1.0
+                    if mat_f is None:
+                        _sc = getattr(self, "texture_scales", {}).get(default_material)
+                        if _sc:
+                            try:
+                                _s, _t = float(_sc[0]), float(_sc[1])
+                                if abs(_s) < 1e-4: _s = 1.0
+                                if abs(_t) < 1e-4: _t = 1.0
+                            except Exception:
+                                _s, _t = 1.0, 1.0
+
                     loops = []
                     front_uvs = []
-                    for tri in f_tris:
+                    for tri, tri_uvs in zip(f_tris, f_uvs):
                         loops.append([f_v_indices[i] for i in tri])
-                        front_uvs.append([f_uvs[i] for i in tri])
+                        front_uvs.append([(u * _s, v * _t) for (u, v) in tri_uvs])
 
                     raw_faces_data.append({
                         'mat_idx': mat_f_idx,
@@ -813,47 +1006,24 @@ class SceneImporter:
                     continue
         except Exception as e:
             skp_log(f"Critical error in Python N-gon fallback: {e}")
+        
+        # Diagnostic report for silent failures
+        if len(entities.faces) > 0 and len(raw_faces_data) == 0:
+            skp_log(f"WARNING: Fallback failed to extract any faces from {len(entities.faces)} potential candidates.")
+        elif len(raw_faces_data) < len(entities.faces) * 0.5:
+             skp_log(f"WARNING: High failure rate in Python fallback. Only {len(raw_faces_data)}/{len(entities.faces)} faces recovered.")
 
         return verts, raw_faces_data, mats
 
-    def create_dual_material(self, name, front_m_name, back_m_name):
-        bmat = bpy.data.materials.new(name=name)
-        bmat.use_nodes = True
-        nodes = bmat.node_tree.nodes
-        links = bmat.node_tree.links
-        nodes.clear()
         
-        out = nodes.new('ShaderNodeOutputMaterial')
-        mix = nodes.new('ShaderNodeMixShader')
-        geom = nodes.new('ShaderNodeNewGeometry')
-        links.new(geom.outputs['Backfacing'], mix.inputs[0])
-        links.new(mix.outputs[0], out.inputs[0])
-        
-        f_mat = self.materials.get(front_m_name)
-        if f_mat:
-            f_bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-            f_bsdf.label = "FRONT"
-            links.new(f_bsdf.outputs[0], mix.inputs[1])
-            if f_mat.use_nodes:
-                orig_p = f_mat.node_tree.nodes.get('Principled BSDF')
-                if orig_p: f_bsdf.inputs['Base Color'].default_value = orig_p.inputs['Base Color'].default_value
-        
-        b_mat = self.materials.get(back_m_name)
-        if b_mat:
-            b_bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-            b_bsdf.label = "BACK"
-            links.new(b_bsdf.outputs[0], mix.inputs[2])
-            if b_mat.use_nodes:
-                orig_p = b_mat.node_tree.nodes.get('Principled BSDF')
-                if orig_p: b_bsdf.inputs['Base Color'].default_value = orig_p.inputs['Base Color'].default_value
-                    
-        return bmat
-
     def write_standalone_edges(self, entities, name, transform, layer_name=None):
+        if not self.import_standalone_edges: return
+        skp_log(f"Writing standalone edges for: {name}")
+        
+        # Binary access to edge lists
         try:
             edges = list(entities.standalone_edges)
         except AttributeError:
-            # Binary doesn't support standalone_edges
             return
         if not edges: return
             
@@ -888,40 +1058,35 @@ class SceneImporter:
             islands.append((island_verts, island_edges))
 
         target_coll = self.context.collection
-        if self.organize_by_tags and layer_name in self.tag_collections:
-            target_coll = self.tag_collections[layer_name]
-        elif name == "Loose Edges" and hasattr(self, 'colls'):
-            target_coll = self.colls.get('edges', target_coll)
+        if name == "Loose Edges" and hasattr(self, 'colls'):
+            target_coll = self.colls.get('edges_node', self.colls.get('root_coll', target_coll))
 
         for idx, (i_verts, i_edges) in enumerate(islands):
-            # Calculate island center (Bounding Box)
-            coords = [v.co for v in i_verts]
-            v_min = Vector((min(c[0] for c in coords), min(c[1] for c in coords), min(c[2] for c in coords)))
-            v_max = Vector((max(c[0] for c in coords), max(c[1] for c in coords), max(c[2] for c in coords)))
-            island_center = (v_min + v_max) / 2
-            
-            # Create sub-mesh for this chain
+            # FIX: Keep SketchUp local coords, origin = transform origin.
+            # (Previously centered to island bbox -> scene center.)
             ob_name = f"{name}_{idx+1:03d}" if len(islands) > 1 else name
             island_me = bpy.data.meshes.new(ob_name)
             island_bm = bmesh.new()
             v_remap = {}
             for v in i_verts:
-                v_remap[v] = island_bm.verts.new(v.co - island_center)
+                v_remap[v] = island_bm.verts.new(v.co)
             for e in i_edges:
-                island_bm.edges.new((v_remap[e.verts[0]], v_remap[e.verts[1]]))
+                try: island_bm.edges.new((v_remap[e.verts[0]], v_remap[e.verts[1]]))
+                except: pass
             
             island_bm.to_mesh(island_me)
             island_bm.free()
             
             ob = bpy.data.objects.new(ob_name, island_me)
-            # Center the object pivot by offsetting matrix_world
-            loc, rot, sca = transform.decompose()
-            world_loc = transform @ island_center
-            ob.matrix_world = Matrix.Translation(world_loc) @ rot.to_matrix().to_4x4() @ Matrix.Diagonal(sca.to_4d())
+            ob.matrix_world = transform
             
             target_coll.objects.link(ob)
+            ob["skp_imported"] = True # Stability tag
+
+            # No ROOT parent (no lines). EDGES collection only for outliner.
 
         bm.free()
+
 
     def write_entities(self, entities, name, parent_transform, default_material="DefaultMaterial", etype=None, parent_ob=None, is_hidden=False):
         # 1. Check for nested content (Use list() for generator compatibility)
@@ -930,64 +1095,89 @@ class SceneImporter:
         has_nested = (len(groups_list) > 0 or len(instances_list) > 0)
         is_loose_root = (name == "SKP Mesh Objects")
         
-        # 2. Collection Determination
-        # USER REQUEST: Hidden objects go ONLY to the hidden collection and stay VISIBLE
-        if is_hidden:
-            target_coll = self.colls['hidden']
-        elif is_loose_root:
-            target_coll = self.colls['mesh']
+        # 2. Category collections for outliner (GROUPS / COMPONENTS / MESH)
+        # FIX: Collections (not empties) so outliner shows bulk groups
+        # without parent lines. Top-level parent = None (no ROOT lines).
+        if is_loose_root:
+            category_coll = self.colls['mesh_node']
         elif etype == EntityType.component:
-            target_coll = self.colls['components']
+            category_coll = self.colls['components_node']
         elif etype == EntityType.group:
-            target_coll = self.colls['groups']
+            category_coll = self.colls['groups_node']
         else:
-            target_coll = self.colls['mesh']
+            category_coll = self.colls['mesh_node']
 
-        # 3. Geometry Writing (Initial pass to determine complexity)
-        should_center = False 
-        # FIX: Include default_material in cache_id to avoid material collisions between instances
+        # Target collection for linking (type-specific sub-collection)
+        target_coll = category_coll
+
+        # 3. Geometry Writing... FIX: no centering, keep SketchUp local coords
+        should_center = False
         cache_id = f"{name}_{default_material}" if etype == EntityType.component else None
         results = self.write_mesh_data(entities=entities, name=name, default_material=default_material, 
-                                      center_geometry=should_center, cache_id=cache_id)
+                                      center_geometry=should_center, cache_id=cache_id, parent_node=category_coll)
         
-        # 4. Pivot Strategy: Only create Empty if it's complex (nested or multiple meshes)
-        is_complex = has_nested or len(results) > 1
+        # 4. Pivot Strategy (LEAN): Only container empties when needed.
+        # Single-mesh groups/components use the mesh itself as pivot,
+        # children parent to that mesh (no extra Empty, no extra line).
+        # Empty only when: no direct mesh (pure container) or multiple meshes.
+        is_complex = len(results) > 1
+        need_empty = (not is_loose_root and etype != EntityType.none and (len(results) == 0 or is_complex))
         main_level_ob = None
-        
-        if is_complex and not is_loose_root and etype != EntityType.none:
+        pivot_for_children = parent_ob  # default: fall through to parent
+        if need_empty:
             main_level_ob = bpy.data.objects.new(name, None)
             main_level_ob.empty_display_type = "PLAIN_AXES"
             main_level_ob.empty_display_size = 0.1
             target_coll.objects.link(main_level_ob)
-            if parent_ob:
-                main_level_ob.parent = parent_ob
+            main_level_ob["skp_imported"] = True
+
+            # Top-level: parent None (no ROOT lines). Nested: parent_ob.
+            main_level_ob.parent = parent_ob
+            if main_level_ob.parent:
+                main_level_ob.matrix_parent_inverse = Matrix.Identity(4)
             main_level_ob.matrix_world = parent_transform
-            
-            # Keep container VISIBLE as per user request
+
             main_level_ob.hide_viewport = False
             main_level_ob.hide_render = False
+            pivot_for_children = main_level_ob
 
         # 5. Link Geometries
+        single_mesh_ob = None
         for me, alpha, island_center, mat_name in results:
             display_name = mat_name.split('.')[0] if '.' in mat_name else mat_name
             ob_name = f"{name}_{display_name}" if is_complex else name
             ob = bpy.data.objects.new(ob_name, me)
-            
+
+            target_coll = category_coll
             target_coll.objects.link(ob)
+            ob["skp_imported"] = True # Stability tag
+
+            # Top-level: parent None (no ROOT lines). Nested: mesh/empty pivot.
             if main_level_ob:
                 ob.parent = main_level_ob
-            elif parent_ob:
+            else:
                 ob.parent = parent_ob
-            
-            # Use parent_transform directly
+
+            if ob.parent:
+                ob.matrix_parent_inverse = Matrix.Identity(4)
+
+
+            # FIX: Origin = SketchUp group/component origin (= parent_transform).
+            # Previously parent_transform @ Translation(island_center) put the
+            # origin at the bbox center (often the import scene center).
             ob.matrix_world = parent_transform
-            
+
             # USER REQUEST: Even if hidden in SKP, keep visible in Blender's hidden folder
             ob.hide_viewport = False
             ob.hide_render = False
-            
+
             if 0.01 < alpha < 1.0: ob.show_transparent = True
             me.update()
+            single_mesh_ob = ob
+
+        # If single mesh and group/component (not loose root), mesh is the pivot
+        if single_mesh_ob and not main_level_ob and not is_loose_root and etype != EntityType.none:
+            pivot_for_children = single_mesh_ob
 
         # 6. Recursion: Groups
         for group in groups_list:
@@ -996,12 +1186,13 @@ class SceneImporter:
             child_world_transform = parent_transform @ Matrix(group.transform)
             self.write_entities(group.entities, g_name, child_world_transform, 
                                default_material=inherent_default_mat(group.material, default_material), 
-                               etype=EntityType.group, parent_ob=main_level_ob or parent_ob,
+                               etype=EntityType.group, parent_ob=pivot_for_children,
                                is_hidden=group.hidden)
 
         # 7. Recursion: Instances (Components)
         for instance in instances_list:
             if self.layers_skip and instance.layer in self.layers_skip: continue
+            
             cdef_name = instance.definition.name
             cdef = self.skp_components.get(cdef_name)
             if not cdef: continue
@@ -1010,7 +1201,7 @@ class SceneImporter:
             child_world_transform = parent_transform @ Matrix(instance.transform)
             self.write_entities(cdef.entities, cdef_name, child_world_transform, 
                                default_material=inh_mat, 
-                               etype=EntityType.component, parent_ob=main_level_ob or parent_ob,
+                               etype=EntityType.component, parent_ob=pivot_for_children,
                                is_hidden=instance.hidden)
 
 
@@ -1020,7 +1211,6 @@ class SceneImporter:
             display_name = mat_name.split('.')[0] if '.' in mat_name else mat_name
             ob = bpy.data.objects.new(f"{name}_{display_name}", me)
             ob.matrix_world = transform
-            ob.location = transform @ island_center
             if 0.01 < alpha < 1.0:
                 ob.show_transparent = True
             me.update()
@@ -1072,8 +1262,8 @@ class SceneImporter:
             ob.rotation_quaternion = Quaternion((rot[0], rot[1], rot[2], rot[3]))
             ob.parent = dob
             if hasattr(self, 'colls'):
-                self.colls['mesh'].objects.link(ob)
-                self.colls['mesh'].objects.link(dob)
+                self.colls['mesh_node'].objects.link(ob)
+                self.colls['mesh_node'].objects.link(dob)
             else:
                 self.context.collection.objects.link(ob)
                 self.context.collection.objects.link(dob)
@@ -1110,8 +1300,9 @@ class SceneImporter:
             dme = bpy.data.meshes.new("DUPLI-" + name)
             dme.vertices.add(len(verts))
             dme.vertices.foreach_set("co", unpack_list(verts))
-            dme.tessfaces.add(f_count / 4)
-            dme.tessfaces.foreach_set("vertices_raw", unpack_face_list(faces))
+            # Blender 4+: polygons (tessfaces removed)
+            dme.polygons.add(f_count // 4)
+            dme.polygons.foreach_set("vertices", unpack_face_list(faces))
             dme.update(calc_edges=True)  # Update mesh with new data
             dme.validate()
             dob = bpy.data.objects.new("DUPLI-" + name, dme)
@@ -1123,8 +1314,8 @@ class SceneImporter:
             ob.scale = real_scale
             ob.parent = dob
             if hasattr(self, 'colls'):
-                self.colls['mesh'].objects.link(ob)
-                self.colls['mesh'].objects.link(dob)
+                self.colls['mesh_node'].objects.link(ob)
+                self.colls['mesh_node'].objects.link(dob)
             else:
                 self.context.collection.objects.link(ob)
                 self.context.collection.objects.link(dob)
@@ -1139,11 +1330,13 @@ class SceneImporter:
         cam_data = bpy.data.cameras.new("Cam: " + name)
         ob = bpy.data.objects.new("Cam: " + name, cam_data)
         
-        # Link to dedicated collection
-        if hasattr(self, 'colls') and 'cameras' in self.colls:
-            self.colls['cameras'].objects.link(ob)
-        else:
-            self.context.collection.objects.link(ob)
+        # Link to root collection and parent to cameras node
+        root_coll = self.colls.get('root_coll', self.context.collection)
+        root_coll.objects.link(ob)
+        
+        if hasattr(self, 'colls') and 'cameras_node' in self.colls:
+            ob.parent = self.colls['cameras_node']
+            ob.matrix_parent_inverse = Matrix.Identity(4)
             
         ob.location = pos
         z = Vector(pos) - Vector(target)
@@ -1185,41 +1378,27 @@ class SceneExporter:
         return {"FINISHED"}
 
 
+
 class ImportSKP(Operator, ImportHelper):
-    """Load a Trimble SketchUp .skp file"""
-
+    """Import SketchUp Scene (.skp)"""
     bl_idname = "import_scene.skp"
-    bl_label = "Import SKP"
-    bl_options = {"PRESET", "REGISTER", "UNDO"}
+    bl_label = "Import Sketchup Scene"
+    bl_options = {'PRESET', 'UNDO'}
+
     filename_ext = ".skp"
+    filter_glob: StringProperty(default="*.skp", options={'HIDDEN'})
 
-    filter_glob: StringProperty(
-        default="*.skp",
-        options={"HIDDEN"},
-    )
-
-    scenes_as_camera: BoolProperty(
-        name="Scene(s) As Camera(s)",
-        description="Import SketchUp Scenes As Blender Camera.",
+    import_scene: BoolProperty(
+        name="Import Scene",
+        description="Imports SketchUp scenes as Blender cameras",
         default=True,
     )
-
-    import_camera: BoolProperty(
-        name="Last View In SketchUp As Camera View",
-        description="Import last saved view in SketchUp as a Blender Camera.",
+    
+    is_update: BoolProperty(
+        name="Is Update",
+        description="Internal flag to indicate if this is a reload operation",
         default=False,
-    )
-
-    organize_by_tags: BoolProperty(
-        name="Organize by Tags (Experimental)",
-        description="Creates collections based on SketchUp Tags/Layers.",
-        default=False,
-    )
-
-    support_back_material: BoolProperty(
-        name="Support Back-face Materials",
-        description="Creates dual-face shaders if front and back materials differ.",
-        default=False,
+        options={'HIDDEN', 'SKIP_SAVE'},
     )
 
     import_standalone_edges: BoolProperty(
@@ -1234,10 +1413,16 @@ class ImportSKP(Operator, ImportHelper):
         default=True,
     )
 
-    merge_coplanar_faces: BoolProperty(
-        name="Merge Coplanar Faces",
-        description="Dissolve coplanar edges to create cleaner N-gons. Disable for exact 1:1 mesh topology",
-        default=False,
+    smart_pbr: BoolProperty(
+        name="Enable Smart PBR Materials",
+        description="Automatically assigns physical properties (Glass, Metal, Water) based on material names.",
+        default=True,
+    )
+
+    max_instance: IntProperty(
+        name="Instantiation Threshold :", 
+        description="Number of components before instancing starts",
+        default=50
     )
 
     dedub_only: BoolProperty(name="Groups Only", description="Import instantiated groups only.", default=False)
@@ -1245,10 +1430,6 @@ class ImportSKP(Operator, ImportHelper):
     reuse_existing_groups: BoolProperty(
         name="Reuse Groups", description="Use existing Blender groups to instance components with.", default=False
     )
-
-    # Altered from initial default of 50 so as to force import all
-    # components to be imported as duplicated objects.
-    max_instance: IntProperty(name="Instantiation Threshold :", default=1)
 
     dedub_type: EnumProperty(
         name="Instancing Type :",
@@ -1259,32 +1440,40 @@ class ImportSKP(Operator, ImportHelper):
         default="VERTEX",
     )
 
-    import_scene: StringProperty(name="Import A Scene :", description="Import a specific SketchUp Scene", default="")
+    import_scene_filter: StringProperty(name="Import A Scene :", description="Import a specific SketchUp Scene", default="")
+
+    def invoke(self, context, event):
+        if context.scene.skp_last_filepath:
+            self.filepath = context.scene.skp_last_filepath
+        return super().invoke(context, event)
 
     def execute(self, context):
-        keywords = self.as_keywords(ignore=("axis_forward", "axis_up", "filter_glob", "split_mode"))
-        # Save settings for reload
-        context.scene.skp_last_filepath = keywords["filepath"]
+        keywords = self.as_keywords()
         
-        # Save settings to scene for Reload persistence
-        context.scene.skp_reuse_material = keywords.get("reuse_material", True)
-        context.scene.skp_organize_by_tags = keywords.get("organize_by_tags", False)
-        context.scene.skp_merge_coplanar = keywords.get("merge_coplanar_faces", False)
+        # SAVE STATE: This is required for the Reload menu to appear and function!
+        scene = context.scene
+        scene.skp_last_filepath = keywords.get("filepath", "")
+        scene.skp_reuse_material = keywords.get("reuse_material", True)
+        scene.skp_smart_pbr = keywords.get("smart_pbr", True)
+        scene.skp_max_instance = keywords.get("max_instance", 50)
         
-        # Detect if we are in update mode (called from Reload operator)
-        is_update = getattr(self, "is_update", False)
+        # Hardcode internal defaults for stripped features
+        keywords["support_back_material"] = True
+        keywords["merge_coplanar_faces"] = False
+        keywords["import_standalone_edges"] = False
         
+        is_update = keywords.pop("is_update", False)
         return SceneImporter().set_filename(keywords["filepath"]).load(context, is_update=is_update, **keywords)
 
     def draw(self, context):
         layout = self.layout
         layout.label(text="- Primary Import Options -")
         row = layout.row()
-        row.prop(self, "scenes_as_camera")
-        row = layout.row()
-        row.prop(self, "import_camera")
+        row.prop(self, "import_scene")
         row = layout.row()
         row.prop(self, "reuse_material")
+        row = layout.row()
+        row.prop(self, "smart_pbr")
         row = layout.row()
         row.prop(self, "dedub_only")
         row = layout.row()
@@ -1292,10 +1481,7 @@ class ImportSKP(Operator, ImportHelper):
         
         layout.label(text="- Advanced Modern Options -")
         box = layout.box()
-        box.prop(self, "organize_by_tags")
-        box.prop(self, "support_back_material")
-        box.prop(self, "import_standalone_edges")
-        box.prop(self, "merge_coplanar_faces")
+        box.prop(self, "smart_pbr")
         
         col = layout.column()
         col.label(text="- Instantiate components, if they are more than -")
@@ -1305,7 +1491,7 @@ class ImportSKP(Operator, ImportHelper):
         row.prop(self, "dedub_type")
         row = layout.row()
         row.use_property_split = True
-        row.prop(self, "import_scene")
+        row.prop(self, "import_scene_filter")
 
 
 class ExportSKP(Operator, ExportHelper):
@@ -1330,54 +1516,192 @@ def menu_func_export(self, context):
 
 
 class SKP_OT_reload(Operator):
-    """Reload the last imported SketchUp file"""
+    """Reload a specific SketchUp file"""
     bl_idname = "import_scene.skp_reload"
     bl_label = "Reload / Update Sketchup Scene"
     bl_options = {"REGISTER", "UNDO"}
 
+    # Add property to target a specific collection
+    target_collection: bpy.props.StringProperty(name="Target Collection", default="")
+
     def execute(self, context):
-        path = context.scene.skp_last_filepath
+        # FIND THE TARGET FILE
+        target_coll = None
+        path = ""
         
+        # 1. If a specific collection is provided, use it
+        if self.target_collection:
+            target_coll = bpy.data.collections.get(self.target_collection)
+            if target_coll:
+                path = target_coll.get("skp_filepath", "")
+        
+        # 2. Otherwise, try to find SKP root from active object (Context-aware)
+        if not path:
+            obj = context.active_object
+            if obj:
+                curr_coll = obj.users_collection[0] if obj.users_collection else None
+                while curr_coll:
+                    if "skp_filepath" in curr_coll:
+                        target_coll = curr_coll
+                        path = curr_coll["skp_filepath"]
+                        break
+                    # Go up hierarchy
+                    parent = None
+                    for c in bpy.data.collections:
+                        if curr_coll.name in c.children:
+                            parent = c
+                            break
+                    curr_coll = parent
+
+        # 3. Fallback to global last path
+        if not path:
+            path = context.scene.skp_last_filepath
+            for c in bpy.data.collections:
+                if c.get("skp_filepath") == path:
+                    target_coll = c
+                    break
+
         if not path or not os.path.exists(path):
-            self.report({'ERROR'}, "Last imported SketchUp file not found. Please import manually first.")
+            self.report({'ERROR'}, "No SketchUp source found for selection. Please select an object from the SKP import or import manually.")
             return {'CANCELLED'}
 
-        skp_log(f"Reloading scene from: {path}")
-
-        # Cleanup existing SketchUp collection if it exists
-        main_coll_name = "SKP Imported Data"
-        main_coll = bpy.data.collections.get(main_coll_name)
+        # 1. PRESERVATION: Backup material assignments by object name
+        material_backup = {}
+        modifier_backup = {}
+        main_coll_name = ""
+        transform_backup = None
         
+        main_coll = target_coll
         if main_coll:
-            # OPTIMIZED: Batch delete all objects in the collection tree
-            # Using all_objects is MUCH faster than recursive deletion for large scenes
-            obs_to_delete = list(main_coll.all_objects)
-            for obj in obs_to_delete:
-                try:
-                    bpy.data.objects.remove(obj, do_unlink=True)
-                except Exception:
-                    pass
+            main_coll_name = main_coll.name
             
-            # Recursively remove child collections
-            def purge_collections(coll):
-                for child in list(coll.children):
-                    purge_collections(child)
-                    bpy.data.collections.remove(child)
+            # BACKUP: Material assignments and Modifiers
+            for obj in main_coll.all_objects:
+                if obj.type == 'MESH':
+                    # Backup Materials
+                    mats = [slot.material.name if slot.material else None for slot in obj.material_slots]
+                    material_backup[obj.name] = mats
+                    
+                    # Backup Modifiers (Architectural Set)
+                    supported_types = {'BEVEL', 'SOLIDIFY', 'MIRROR', 'ARRAY', 'SUBSURF'}
+                    target_mods = [m for m in obj.modifiers if m.type in supported_types]
+                    
+                    if target_mods:
+                        mod_data = []
+                        for m in target_mods:
+                            data = {'name': m.name, 'type': m.type}
+                            
+                            if m.type == 'BEVEL':
+                                data.update({
+                                    'width': m.width, 'segments': m.segments,
+                                    'limit_method': m.limit_method, 'angle_limit': m.angle_limit,
+                                    'harden_normals': getattr(m, 'harden_normals', False),
+                                    'miter_inner': getattr(m, 'miter_inner', 'OFFSET'),
+                                    'miter_outer': getattr(m, 'miter_outer', 'SHARP')
+                                })
+                            elif m.type == 'SOLIDIFY':
+                                data.update({'thickness': m.thickness, 'offset': m.offset})
+                            elif m.type == 'MIRROR':
+                                data.update({'use_axis': list(m.use_axis), 'mirror_object': m.mirror_object.name if m.mirror_object else None})
+                            elif m.type == 'ARRAY':
+                                data.update({'count': m.count, 'relative_offset_displace': list(m.relative_offset_displace)})
+                            elif m.type == 'SUBSURF':
+                                data.update({'levels': m.levels, 'render_levels': m.render_levels})
+                                
+                            mod_data.append(data)
+                        modifier_backup[obj.name] = mod_data
             
-            purge_collections(main_coll)
+            # BACKUP: Transformation if requested
+            root_empty_name = f"ROOT: {os.path.basename(path)}"
+            root_empty = bpy.data.objects.get(root_empty_name)
+            transform_backup = None
+            if context.scene.skp_keep_transform and root_empty:
+                transform_backup = root_empty.matrix_world.copy()
+
+
+            skp_log("Batch purging existing objects for fast reload...")
             
-        # Re-trigger import with default settings or stored settings if we had them
-        # For now, we use defaults or just re-import into the same collection.
-        # We call the importer operator without the file dialog.
-        # Re-trigger import with settings stored in the scene
+            # 2. CLEANUP: Remove everything linked to the root collection
+            # except the root collection itself for UI stability
+            obs_to_remove = list(main_coll.all_objects)
+            # Remove objects, which includes our ROOT empty and sub-empties
+            bpy.data.batch_remove(ids=obs_to_remove)
+            
+            # 3. MESH CLEANUP: Fast orphan removal
+            bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+            gc.collect()
+            
+        # 4. RE-IMPORT
         bpy.ops.import_scene.skp(
             filepath=path,
+            is_update=True,
             reuse_material=context.scene.skp_reuse_material,
-            organize_by_tags=context.scene.skp_organize_by_tags,
-            merge_coplanar_faces=context.scene.skp_merge_coplanar
+            smart_pbr=context.scene.skp_smart_pbr,
+            max_instance=context.scene.skp_max_instance
         )
         
+        if context.scene.skp_reuse_material and material_backup:
+            new_main_coll = bpy.data.collections.get(main_coll_name)
+            if new_main_coll:
+                for obj in new_main_coll.all_objects:
+                    if obj.type == 'MESH' and obj.name in material_backup:
+                        saved_mats = material_backup[obj.name]
+                        for i, mat_name in enumerate(saved_mats):
+                            if i < len(obj.material_slots) and mat_name:
+                                mat = bpy.data.materials.get(mat_name)
+                                if mat:
+                                    obj.material_slots[i].material = mat
+                                    
+        # 6. RESTORATION: Re-apply Modifiers
+        if modifier_backup:
+            new_main_coll = bpy.data.collections.get(main_coll_name)
+            if new_main_coll:
+                for obj in new_main_coll.all_objects:
+                    if obj.type == 'MESH' and obj.name in modifier_backup:
+                        for m_data in modifier_backup[obj.name]:
+                            # Ensure we don't double-add
+                            if m_data['name'] not in obj.modifiers:
+                                try:
+                                    m = obj.modifiers.new(name=m_data['name'], type=m_data['type'])
+                                    if m_data['type'] == 'BEVEL':
+                                        m.width = m_data['width']
+                                        m.segments = m_data['segments']
+                                        m.limit_method = m_data['limit_method']
+                                        m.angle_limit = m_data['angle_limit']
+                                        if hasattr(m, 'harden_normals'): m.harden_normals = m_data['harden_normals']
+                                        m.miter_inner = m_data['miter_inner']
+                                        m.miter_outer = m_data['miter_outer']
+                                    elif m_data['type'] == 'SOLIDIFY':
+                                        m.thickness = m_data['thickness']
+                                        m.offset = m_data['offset']
+                                    elif m_data['type'] == 'MIRROR':
+                                        m.use_axis = m_data['use_axis']
+                                        if m_data['mirror_object']:
+                                            m.mirror_object = bpy.data.objects.get(m_data['mirror_object'])
+                                    elif m_data['type'] == 'ARRAY':
+                                        m.count = m_data['count']
+                                        m.relative_offset_displace = m_data['relative_offset_displace']
+                                    elif m_data['type'] == 'SUBSURF':
+                                        m.levels = m_data['levels']
+                                        m.render_levels = m_data['render_levels']
+                                except Exception as e:
+                                    skp_log(f"Failed to restore modifier {m_data['name']}: {e}")
+                                    
+        # 7. RESTORATION: Re-apply transformation
+        if context.scene.skp_keep_transform and transform_backup:
+            root_empty_name = f"ROOT: {os.path.basename(path)}"
+            root_empty = bpy.data.objects.get(root_empty_name)
+            if root_empty:
+                root_empty.matrix_world = transform_backup
+
+        
         self.report({'INFO'}, f"Reloaded: {os.path.basename(path)}")
+        
+        # 6. CLEANUP: Purge orphan data-blocks specifically from SKP
+        # This keeps the file size small during repeated reloads
+        for i in range(2):
+            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+            
         return {'FINISHED'}
 
 
@@ -1387,8 +1711,20 @@ class SKP_OT_proxy_toggle(Operator):
     bl_idname = "import_scene.skp_proxy_toggle"
     bl_label = "Toggle Proxy Mode"
     
+    target_collection: bpy.props.StringProperty(name="Target Collection", default="")
+
     def execute(self, context):
-        main_coll = bpy.data.collections.get("SKP Imported Data")
+        main_coll = None
+        if self.target_collection:
+            main_coll = bpy.data.collections.get(self.target_collection)
+        
+        # Fallback: find the first available SKP collection
+        if not main_coll:
+            for c in bpy.data.collections:
+                if "skp_filepath" in c:
+                    main_coll = c
+                    break
+        
         if not main_coll: return {'CANCELLED'}
         
         current_state = 'TEXTURED'
@@ -1401,19 +1737,173 @@ class SKP_OT_proxy_toggle(Operator):
         for obj in main_coll.all_objects:
             if obj.type == 'MESH':
                 obj.display_type = new_state
+                obj.show_all_edges = (new_state != 'BOUNDS')
         
-        self.report({'INFO'}, f"Proxy Mode: {'ON' if new_state == 'BOUNDS' else 'OFF'}")
+        return {'FINISHED'}
+
+class SKP_OT_delete(Operator):
+    """Completely remove an imported SketchUp file and its data"""
+    bl_idname = "import_scene.skp_delete"
+    bl_label = "Delete SKP Import"
+    bl_options = {"REGISTER", "UNDO"}
+    
+    target_collection: bpy.props.StringProperty(name="Target Collection", default="")
+
+    def execute(self, context):
+        if not self.target_collection: return {'CANCELLED'}
+        target_coll = bpy.data.collections.get(self.target_collection)
+        if target_coll:
+            obs = list(target_coll.all_objects)
+            # Collect meshes to ensure they are purged
+            target_meshes = [o.data for o in obs if o.type == 'MESH' and o.data]
+            
+            bpy.data.batch_remove(ids=obs)
+            bpy.data.collections.remove(target_coll)
+            
+            # Fast cleanup of orphaned data
+            bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        
+        self.report({'INFO'}, f"Deleted SketchUp import: {self.target_collection}")
         return {'FINISHED'}
 
 class SKP_OT_deep_purge(Operator):
-    """Purge all unused data-blocks"""
+    """Deep clean all unused data-blocks, empty objects and collections"""
     bl_idname = "import_scene.skp_deep_purge"
-    bl_label = "Purge Unused SKP Data"
+    bl_label = "Deep Purge"
     
     def execute(self, context):
+        # 1. Standard recursive purge of orphans
+        bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+
+        # Collect SKP descendant collections for scoped cleanup
+        skp_descendants = set()
+        for coll in bpy.data.collections:
+            if "skp_filepath" in coll:
+                stack = list(coll.children)
+                while stack:
+                    c = stack.pop()
+                    if c.name in skp_descendants:
+                        continue
+                    skp_descendants.add(c.name)
+                    stack.extend(c.children)
+
+        # 2. Cleanup Empty Objects — SKP-tagged only (never generic empties)
+        empties_removed = 0
+        for obj in list(bpy.data.objects):
+            if obj.type == 'EMPTY' and not obj.children:
+                if obj.get("skp_imported"):
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    empties_removed += 1
+
+        # 3. Cleanup Empty Collections — SKP hierarchy only
+        colls_removed = 0
+        for coll in list(bpy.data.collections):
+            if coll.name not in skp_descendants:
+                continue
+            if not coll.all_objects and not coll.children:
+                if coll.library is None and coll.asset_data is None:
+                    bpy.data.collections.remove(coll)
+                    colls_removed += 1
+        
+        # 4. Final recursive purge for any data-blocks freed by the above
+        bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        
+        self.report({'INFO'}, f"Deep Purge: Removed {empties_removed} pivots and {colls_removed} collections.")
+        return {'FINISHED'}
+
+class SKP_OT_purge_materials(Operator):
+    """Clean unused materials and empty slots while respecting Fake User protection"""
+    bl_idname = "import_scene.skp_purge_materials"
+    bl_label = "Purge Materials"
+    
+    def execute(self, context):
+        count = 0
+        
+        # Phase 1: Clean redundant material slots safely
+        slots_removed = 0
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH' or obj.data.library is not None:
+                continue
+
+            # Find which material indices are actually used on faces
+            used_indices = {p.material_index for p in obj.data.polygons}
+
+            # Remove unused slots, highest index first so lower ones stay valid
+            for i in range(len(obj.material_slots) - 1, -1, -1):
+                if i in used_indices:
+                    continue
+                mat = obj.material_slots[i].material
+
+                # SAFETY CHECK: Only remove if it's safe
+                if mat is None:
+                    can_remove = True  # Empty slot
+                elif mat.use_fake_user:
+                    can_remove = False  # User explicitly wants to keep this!
+                elif "DefaultMaterial" in mat.name:
+                    can_remove = True  # Unused default is safe to remove
+                else:
+                    can_remove = bool(mat.get("skp_imported"))
+
+                if can_remove:
+                    # Direct mesh-data removal: no operator context needed
+                    try:
+                        obj.data.materials.pop(index=i)
+                        slots_removed += 1
+                    except (RuntimeError, TypeError):
+                        pass
+
+        # Phase 2: Force recursive orphan removal (RESPECTING FAKE USER)
+        # We run multiple passes because removing a material might orphan a texture
         for i in range(3):
-            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
-        self.report({'INFO'}, "Deep Purge complete.")
+            for mat in list(bpy.data.materials):
+                if mat.library is None and mat.asset_data is None:
+                    # NEVER delete if it has a Fake User or active users
+                    if mat.users == 0 and not mat.use_fake_user:
+                        bpy.data.materials.remove(mat, do_unlink=True)
+                        count += 1
+            
+            bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        
+        self.report({'INFO'}, f"Material Purge: Removed {count} unused materials and {slots_removed} empty slots.")
+        return {'FINISHED'}
+
+class SKP_OT_apply_smooth(Operator):
+    """Apply Smooth by Angle to selected objects"""
+    bl_idname = "import_scene.skp_apply_smooth"
+    bl_label = "Smooth Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected = context.selected_objects
+        count = 0
+        
+        if context.active_object and context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        for ob in selected:
+            if ob.type == 'MESH':
+                context.view_layer.objects.active = ob
+                ob.select_set(True)
+                
+                # FORCE MODIFIER ADDITION (Explicitly from Essentials)
+                try:
+                    # 1. First ensure it's set to smooth shading
+                    bpy.ops.object.shade_smooth()
+                    
+                    # 2. Call the operator that ADDS the modifier box
+                    bpy.ops.object.shade_smooth_by_angle()
+                    
+                    # 3. Double check if it was added, if not, use the asset call
+                    if not any("Smooth" in m.name for m in ob.modifiers):
+                        bpy.ops.object.modifier_add_node_group(
+                            asset_library_type='ESSENTIALS', 
+                            asset_identifier='Smooth by Angle'
+                        )
+                    count += 1
+                except Exception as e:
+                    skp_log(f"Smoothing failed: {e}")
+
+        self.report({'INFO'}, f"Added Smooth by Angle modifier to {count} objects.")
         return {'FINISHED'}
 
 class SKP_PT_panel(bpy.types.Panel):
@@ -1428,65 +1918,109 @@ class SKP_PT_panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         
-        col = layout.column(align=True)
-        if scene.skp_last_filepath:
+        # 1. PERMANENT IMPORT BUTTON
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator("import_scene.skp", text="IMPORT NEW SKP", icon='IMPORT')
+        
+        layout.separator()
+
+        # Tools Section
+        box = layout.box()
+        row = box.row(align=True)
+        row.operator("import_scene.skp_apply_smooth", text="Smooth", icon='MOD_SMOOTH')
+        row.operator("import_scene.skp_deep_purge", text="Purge", icon='TRASH')
+
+        layout.separator()
+        
+        # 2. LIST ALL INDEPENDENT IMPORTS
+        layout.label(text="Imported SketchUp Files:", icon='FILE_3D')
+        
+        skp_imports_found = False
+        import os
+        
+        for coll in bpy.data.collections:
+            if "skp_filepath" in coll:
+                skp_imports_found = True
+                path = coll["skp_filepath"]
+                filename = os.path.basename(path)
+                
+                box = layout.box()
+                row = box.row(align=True)
+                row.label(text=filename, icon='COLLECTION_NEW')
+                
+                # RELOAD specific button
+                r_op = row.operator("import_scene.skp_reload", text="", icon='FILE_REFRESH')
+                r_op.target_collection = coll.name
+                
+                # PROXY specific button
+                p_op = row.operator("import_scene.skp_proxy_toggle", text="", icon='GHOST_ENABLED')
+                p_op.target_collection = coll.name
+                
+                # DELETE specific button
+                d_op = row.operator("import_scene.skp_delete", text="", icon='REMOVE')
+                d_op.target_collection = coll.name
+
+
+        if not skp_imports_found:
+            layout.label(text="No SKP files in scene.", icon='INFO')
+
+        layout.separator()
+        
+        # 3. GENERAL SETTINGS AND TOOLS
+        if skp_imports_found or scene.skp_last_filepath:
+            col = layout.column(align=True)
             box = col.box()
-            box.label(text="Last Imported File:", icon='FILEBROWSER')
-            box.label(text=os.path.basename(scene.skp_last_filepath))
-            
-            col.separator()
-            
-            box = col.box()
-            box.label(text="Reload Settings:", icon='SETTINGS')
+            box.label(text="Global Settings:", icon='SETTINGS')
             box.prop(scene, "skp_reuse_material", text="Keep My Material Edits")
-            box.prop(scene, "skp_organize_by_tags", text="Use Tag Collections")
+            box.prop(scene, "skp_keep_transform", text="Keep My Placement")
+            box.prop(scene, "skp_smart_pbr", text="Convert to Smart PBR")
             
             col.separator()
-            row = col.row()
-            row.scale_y = 1.8
-            row.operator("import_scene.skp_reload", text="RELOAD / UPDATE SCENE", icon='FILE_REFRESH')
             
             layout.label(text="Advanced Tools:")
             grid = layout.grid_flow(columns=2, align=True)
-            grid.operator("import_scene.skp_proxy_toggle", text="Proxy Mode", icon='GHOST_ENABLED')
-            grid.operator("import_scene.skp_deep_purge", text="Purge", icon='TRASH')
-        else:
-            col.label(text="No SKP scene imported yet.")
-            col.operator("import_scene.skp", text="Import first Sketchup file", icon='IMPORT')
+            grid.operator("import_scene.skp_proxy_toggle", text="Global Proxy", icon='GHOST_ENABLED')
+            grid.operator("import_scene.skp_deep_purge", text="Deep Purge", icon='TRASH')
+            grid.operator("import_scene.skp_purge_materials", text="Purge Mats", icon='MATERIAL')
 
 
 def register():
-    bpy.utils.register_class(SketchupAddonPreferences)
-    bpy.utils.register_class(ImportSKP)
+    # Register Classes
+    for cls in (SketchupAddonPreferences, ImportSKP, ExportSKP, 
+                SKP_OT_reload, SKP_OT_proxy_toggle, SKP_OT_delete, SKP_OT_deep_purge, 
+                SKP_OT_purge_materials, SKP_OT_apply_smooth, SKP_PT_panel):
+        bpy.utils.register_class(cls)
+    
+    # Menus
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
-    bpy.utils.register_class(ExportSKP)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
     
-    # New Reload features
-    bpy.utils.register_class(SKP_OT_reload)
-    bpy.utils.register_class(SKP_OT_proxy_toggle)
-    bpy.utils.register_class(SKP_OT_deep_purge)
-    bpy.utils.register_class(SKP_PT_panel)
+    # Scene Properties
     bpy.types.Scene.skp_last_filepath = StringProperty(name="Last SKP File", default="")
     bpy.types.Scene.skp_reuse_material = BoolProperty(name="Use Existing Materials", default=True)
-    bpy.types.Scene.skp_organize_by_tags = BoolProperty(name="Use Tags", default=False)
-    bpy.types.Scene.skp_merge_coplanar = BoolProperty(name="Merge Coplanar", default=False)
+    bpy.types.Scene.skp_keep_transform = BoolProperty(name="Keep Placement", default=True)
+    bpy.types.Scene.skp_smart_pbr = BoolProperty(name="Smart PBR", default=True)
+    bpy.types.Scene.skp_max_instance = IntProperty(name="Max Instance", default=50)
 
 
 def unregister():
-    bpy.utils.unregister_class(ImportSKP)
-    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    bpy.utils.unregister_class(ExportSKP)
-    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    # Remove menu functions
+    try: bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    except: pass
+    try: bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    except: pass
     
-    # New Reload features
-    bpy.utils.unregister_class(SKP_OT_reload)
-    bpy.utils.unregister_class(SKP_OT_proxy_toggle)
-    bpy.utils.unregister_class(SKP_OT_deep_purge)
-    bpy.utils.unregister_class(SKP_PT_panel)
-    del bpy.types.Scene.skp_last_filepath
-    del bpy.types.Scene.skp_reuse_material
-    del bpy.types.Scene.skp_organize_by_tags
-    del bpy.types.Scene.skp_merge_coplanar
+    # Remove Scene properties safely
+    props = ["skp_last_filepath", "skp_reuse_material", "skp_keep_transform",
+             "skp_smart_pbr", "skp_max_instance"]
+    for p in props:
+        if hasattr(bpy.types.Scene, p):
+            delattr(bpy.types.Scene, p)
     
-    bpy.utils.unregister_class(SketchupAddonPreferences)
+    # Unregister classes in reverse order
+    for cls in reversed((SketchupAddonPreferences, ImportSKP, ExportSKP, 
+                         SKP_OT_reload, SKP_OT_proxy_toggle, SKP_OT_deep_purge, 
+                         SKP_OT_purge_materials, SKP_PT_panel)):
+        try: bpy.utils.unregister_class(cls)
+        except: pass

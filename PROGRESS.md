@@ -20,7 +20,12 @@ This document summarizes the major technical improvements made to the SketchUp I
 - **Blender 5.1 Ready**: Fully verified for the latest Blender releases.
 - **Automated Build System**: `build_addons.py` handles Cython, Framework bundling, and macOS library paths automatically.
 
+## 5. Stability & Purge Control (May 2026)
+- **Safe Purge Logic**: Materials with "Fake User" (shield) are now protected. Purge no longer deletes custom material assignments or slots.
+- **Nuclear Material Cleanup**: Added recursive material orphan cleanup with user-safeguards.
+- **Deep Purge Enhancements**: Automatically cleans up orphaned "Empty" pivots and empty collections for a surgically clean workspace.
+- **Stability Tagging**: All imported assets are tagged for intelligent management and filtering.
+
 ---
 **Lead Architect for 2026 Update**: gurkanerol
-**Status**: Production Ready / Finalized
-**Base Project**: pyslapi by Martijn Berger
+**Status**: Production Ready / Finalized (v2026.6.0.0)

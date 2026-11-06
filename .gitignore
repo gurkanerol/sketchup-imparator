@@ -22,3 +22,10 @@ samples/
 *.egg-info
 
 target/
+venv/
+.venv*/
+build_env/
+build_temp/
+uv
+uvx
+*.blend

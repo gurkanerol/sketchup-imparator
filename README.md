@@ -10,7 +10,7 @@ Python bindings for the official Sketchup API and an importer for blender based 
 3) From the top menu, choose: **Edit > Preferences...**
 4) Click on the **Add-ons** tab
 5) Click on the **Install...** button
-6) Browse to and select the downloaded zip file (e.g., `sketchup_imparator_v2026.1.0.zip`)
+6) Browse to and select the downloaded zip file (e.g., `sketchup_imparator_v2026.6.0.0.zip`)
 7) Click **Install Add-on**
 8) In the add-ons list, search for "Sketchup"
 9) Enable the add-on by clicking the checkbox next to **Import-Export: Sketchup importer**
@@ -73,13 +73,15 @@ The project is now fully automated for easy maintenance.
 3. **SketchUp SDK**: Download and extract to the root.
 
 ### Build & Package
-1. Copy `SketchUpAPI.framework` and `LayOutAPI.framework` to the root directory.
+1. Copy `SketchUpAPI.framework` to the root directory.
 2. Run the automated build script:
    ```bash
    ./uv run python3 build_addons.py
    ```
 3. The distributable addon will be generated in:
-   `dist/sketchup_imparator_v2026.1.0.zip`
+   `dist/sketchup_imparator_v2026.6.0.0.zip`
+
+See [DOCS/CURRENT.md](DOCS/CURRENT.md) for the current architecture and usage.
 
 ---
 *Note: This project is licensed under the GPL-3.0 License.*

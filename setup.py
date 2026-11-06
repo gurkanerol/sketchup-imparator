@@ -4,10 +4,8 @@
 __author__ = "gurkanerol (2026 Modernization), Martijn Berger (Original Creator)"
 
 import platform
-from distutils.core import setup
-from distutils.extension import Extension
-
-from Cython.Distutils import build_ext
+from setuptools import setup, Extension
+from Cython.Build import cythonize
 
 if platform.system() == "Linux":
     libraries = ["SketchUpAPI"]
@@ -54,10 +52,10 @@ ext_modules = [
     )
 ]
 
-for e in ext_modules:
-    e.cython_directives = {"language_level": "3"}  # all are Python-3
-
-setup(name="Sketchup", cmdclass={"build_ext": build_ext}, ext_modules=ext_modules)
+setup(
+    name="Sketchup",
+    ext_modules=cythonize(ext_modules, compiler_directives={"language_level": "3"}),
+)
 
 # install_name_tool -change "@rpath/SketchUpAPI.framework/Versions/Current/SketchUpAPI" "@loader_path/SketchUpAPI.framework/Versions/Current/SketchUpAPI" sketchup.so
 # install_name_tool -change "@rpath/SketchUpAPI.framework/Versions/A/SketchUpAPI" "@loader_path/SketchUpAPI.framework/Versions/A/SketchUpAPI" sketchup.cpython-35m-darwin.so

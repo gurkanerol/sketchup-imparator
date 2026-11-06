@@ -4,10 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sketchup-imparator"
-version = "2026.1.0"
+version = "2026.6.0.0"
 authors = [
     {name = "gurkanerol"},
-    {name = "Martijn Berger"}
 ]
 description = "Professional Python bindings and Blender importer for the SketchUp API (2026 Modernization)"
 readme = "README.md"
@@ -22,7 +21,7 @@ classifiers = [
 "Bug Tracker" = "https://github.com/gurkanerol/sketchup-imparator/issues"
 
 [tool.setuptools]
-packages = ["sketchup_imparator", "slapi"]
+packages = ["sketchup_imparator"]
 
 # Note: We still need setup.py for proper Cython extension configuration
 # See setup.py for the extension module definitions 

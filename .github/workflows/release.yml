@@ -1,0 +1,59 @@
+name: Build and Release SketchUp Importer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-13
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Download SketchUp SDK (Action Required)
+        # ⚠️ UYARI: SketchUpAPI.framework Git'te takip edilmediği için CI ortamına dışarıdan dahil edilmelidir.
+        # Trimble Developer portalından indirdiğiniz SDK'yı bir private GitHub Release'ine yükleyip,
+        # buraya wget ile indirme ve zipten çıkarma adımlarını eklemelisiniz.
+        run: |
+          echo "Please ensure SketchUpAPI.framework is present in the root directory before building."
+          # Örnek (Eğer bir sunucuda barındırıyorsanız):
+          # curl -O https://your-server.com/SketchUpAPI.framework.zip
+          # unzip SketchUpAPI.framework.zip
+
+      - name: Build Extension (Smart Compile & Package)
+        run: |
+          python3 build_addons.py
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sketchup_imparator_mac
+          path: dist/*.zip
+
+  create-release:
+    needs: build-mac
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sketchup_imparator_mac
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

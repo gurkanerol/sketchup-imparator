@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sketchup-imparator"
+version = "2026.7.0"
+authors = [
+    {name = "gurkanerol"},
+]
+description = "Blender importer for native SketchUp (.skp) files, powered by the OpenSKP parser"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-or-later"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: MacOS :: MacOS X",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/gurkanerol/sketchup-imparator"
+"Bug Tracker" = "https://github.com/gurkanerol/sketchup-imparator/issues"
+
+[tool.setuptools.packages.find]
+include = ["sketchup_imparator*"]
+
+[tool.setuptools.package-data]
+# defusedxml's licence travels inside its own wheel, next to the code it
+# covers (defusedxml-0.7.1.dist-info/LICENSE).
+sketchup_imparator = ["wheels/*.whl", "_vendor/openskp/LICENSE"]
+
+[tool.ruff]
+# Allow lines to be as long as 120.
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "C4",  # Flake comprehensions Complexity is too high
+    "DTZ", # timezone-aware datetimes, banning naive datetime usage
+    "E",   # Fix pydocstyle errors
+    "F",   # PyFlakes
+    "I",   # isort
+    "RUF", # Ruff lints
+    "UP",  # pyupgrade
+    "W",   # Fix tabs, trailing spaces, bad newlines, long doc lines, and bad escape sequences.
+    ]
+ignore = [
+    "E203",   # Whitespace-before-punctuation
+    "RUF012", # mutable-class-default
+    ]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 120

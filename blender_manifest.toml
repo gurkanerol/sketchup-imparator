@@ -1,0 +1,36 @@
+schema_version = "1.0.0"
+
+id = "sketchup_imparator"
+version = "2026.7.0"
+name = "SketchUp Imparator"
+tagline = "Import native SketchUp .skp files, components kept as instances"
+maintainer = "gurkanerol"
+type = "add-on"
+website = "https://github.com/gurkanerol/sketchup-imparator"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+platforms = ["macos-arm64"]
+tags = ["Import-Export", "Modeling"]
+
+# Wheels are the only dependencies shipped: defusedxml is openskp's XML
+# parser (its upstream pure-Python wheel), mapbox_earcut triangulates concave
+# and holed polygons correctly - a plain fan would break those faces. ABI
+# coverage matches the bundled Python: cp311 = Blender 4.2-5.0, cp313 =
+# Blender 5.1+. No Blender release ships Python 3.12, so there is no cp312
+# wheel. shapely is NOT bundled (3 MB of GEOS per ABI); openskp's rare
+# overlapping-hole union is skipped instead, see shapely_fallback.py.
+wheels = [
+  "./wheels/defusedxml-0.7.1-py2.py3-none-any.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_11_0_arm64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp313-cp313-macosx_11_0_arm64.whl",
+]
+
+# Must stay after the root keys: everything below a table header belongs to
+# that table, and "wheels" is a root key.
+[permissions]
+files = "Read the selected .skp file and write temporary textures"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", ".DS_Store"]

@@ -1,0 +1,2537 @@
+"""Legacy (classic MFC) SketchUp ``.skp`` parser — SketchUp 2013–2020 era.
+
+Pre-2021 ``.skp`` files are not VFF/ZIP containers: after the same UTF-16
+header records, the body is **one uncompressed MFC ``CArchive`` object
+stream** with a single global 1-based store map.  This module walks that
+stream and adapts the result to the same dict shape that
+:func:`openskp._core.full_parse` returns for VFF files, so
+:class:`openskp.SkpFile` handles both eras transparently.
+
+The decoding below was established by clean-room reverse engineering of
+real SketchUp 2016/2017/2018 files, cross-validated against the same
+models re-saved as VFF by SketchUp (exact face/edge counts, total area
+and bounding box parity).  Where the walk logic matches the public 2017
+format notes it follows them; several details were found to differ in
+real files and follow the bytes instead:
+
+* ``CEdge``: the two vertex pointers come **before** the curve pointer.
+* ``CLoop``: two flag bytes follow the preamble.
+* ``CEdgeUse``: has a standard entity preamble.
+* ``CFace``: the back-material u16 comes right after the loops, and is
+  followed by one redundant edge back-ref word per edge that was
+  first-serialized inside this face's loops (push/pulled faces).
+* ``CMaterial``: solid tail is ``opacity:f64 + use_opacity:u8`` — the
+  trailing byte gates the opacity exactly like VFF's ``useTrans``.
+* v2016 (``CEntity`` schema 3) has **no persistent-id mask** in entity
+  preambles; 2017+ (schema 5) stores mask + pid bytes.
+* The definition-list header's object pointer references the **active**
+  layer (usually, but not always, the default layer).
+
+Version-specific byte counts (v16 vs v17/v18) are keyed off the header
+version string.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import struct
+import time
+from typing import Any, Dict, Optional
+
+from .errors import SkpParseError
+
+logger = logging.getLogger("openskp.legacy")
+
+# Mirrors _core._PROGRESS_INTERVAL - coarse enough to cost nothing on
+# files with 100k+ component definitions.
+_PROGRESS_INTERVAL = 500
+
+
+class LegacyParseError(ValueError):
+    """A structural error while walking the legacy archive."""
+
+
+_STR_MARKER = b'\xff\xfe\xff'
+
+
+class _R:
+    """Byte cursor."""
+
+    def __init__(self, data: bytes, pos: int = 0):
+        self.data = data
+        self.pos = pos
+
+    def u8(self) -> int:
+        v = self.data[self.pos]
+        self.pos += 1
+        return v
+
+    def u16(self) -> int:
+        v = struct.unpack_from('<H', self.data, self.pos)[0]
+        self.pos += 2
+        return v
+
+    def u32(self) -> int:
+        v = struct.unpack_from('<I', self.data, self.pos)[0]
+        self.pos += 4
+        return v
+
+    def f64(self) -> float:
+        v = struct.unpack_from('<d', self.data, self.pos)[0]
+        self.pos += 8
+        return v
+
+    def f64s(self, n: int):
+        v = struct.unpack_from('<%dd' % n, self.data, self.pos)
+        self.pos += 8 * n
+        return v
+
+    def raw(self, n: int) -> bytes:
+        v = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return v
+
+    def peek(self, n: int) -> bytes:
+        return self.data[self.pos:self.pos + n]
+
+    def peek_u16(self) -> int:
+        return struct.unpack_from('<H', self.data, self.pos)[0]
+
+    def utf16(self) -> str:
+        if self.peek(3) != _STR_MARKER:
+            raise LegacyParseError(f"expected a string record {self.ctx()}")
+        self.pos += 3
+        n = self.u8()
+        if n == 0xFF:
+            n = self.u16()
+            if n == 0xFFFF:
+                n = self.u32()
+        return self.raw(2 * n).decode('utf-16-le', errors='replace')
+
+    def ctx(self, back: int = 16, fwd: int = 32) -> str:
+        p = self.pos
+        return (f"@{p:#x}: …{self.data[max(0, p - back):p].hex(' ')} | "
+                f"{self.data[p:p + fwd].hex(' ')}…")
+
+
+class _Archive:
+    """MFC CArchive store-map bookkeeping and object-graph walk."""
+
+    def __init__(self, data: bytes, ver: int):
+        self.data = data
+        self.ver = ver                # SketchUp major version (16/17/18…)
+        self.has_pid = ver >= 17      # CEntity schema 5 stores pid masks
+        self.r = _R(data)
+        self.slots: Dict[int, tuple] = {}    # slot -> ('class'|'obj', name, value)
+        self.class_slot: Dict[str, int] = {}
+        self.class_schema: Dict[str, int] = {}
+        self.current_class: Optional[str] = None  # class of the object being read
+        self.current_obj_slot: Optional[int] = None
+        self.next_slot = 0
+        self.walk_base = 0            # slots below this are unwalked pre-model
+        self.readers: Dict[str, Any] = {}
+        self.current_loop: Optional[int] = None
+        self.in_entity_list = False
+        self._as_item = False
+        # Burned store-map indices (see _read_edgeuse): the writer maps an
+        # annotation's connection points into the store map WITHOUT writing
+        # bytes, so file back-references beyond each burn run ahead of the
+        # walker's numbering. Registrations always stay at WALKER indices —
+        # no captured slot ever goes stale — and _backref translates file
+        # references through the burn bands instead. ``burns`` holds
+        # (file_band_start, width) per event; ``cum_delta`` their total;
+        # ``annot_watermark`` the walker slot right after the last
+        # annotation record — the only place a band can start.
+        self.burns: list = []
+        self.cum_delta = 0
+        self.annot_watermark: Optional[int] = None
+        self.burn_stack: list = []    # per-entity-list burned-item credits
+        # per-entity-list instances an annotation's path wrote in full (see
+        # _path_ref) that the list has not listed yet, slot -> None in order
+        self.inline_stack: list = []
+
+    def alloc(self, entry) -> int:
+        s = self.next_slot
+        self.slots[s] = entry
+        self.next_slot += 1
+        return s
+
+    def read_object(self, r: _R, expect: Optional[str] = None):
+        tag = r.u16()
+        if tag == 0:
+            return None, None, None
+        if tag == 0x7FFF:                      # big-tag escape
+            big = r.u32()
+            if big & 0x80000000:
+                return self._new_of_class(r, big & 0x7FFFFFFF, expect)
+            return self._backref(big, r)
+        if tag == 0xFFFF:                      # new class
+            schema = r.u16()
+            namelen = r.u16()
+            if namelen > 40:
+                raise LegacyParseError(f"implausible class name length {r.ctx()}")
+            name = r.raw(namelen).decode('ascii')
+            self.alloc(('class', name, schema))
+            self.class_slot[name] = self.next_slot - 1
+            self.class_schema[name] = schema
+            return self._new_obj(r, name)
+        if tag & 0x8000:                       # class ref -> new object
+            return self._new_of_class(r, tag & 0x7FFF, expect)
+        return self._backref(tag, r)           # object back-ref
+
+    def _new_of_class(self, r, cslot, expect):
+        ent = self.slots.get(cslot)
+        if ent is None:
+            if expect is None:
+                raise LegacyParseError(f"class-ref to unknown slot {cslot} {r.ctx()}")
+            # a class defined in the unwalked pre-model region: learn it
+            # from context
+            self.slots[cslot] = ('class', expect, None)
+            self.class_slot[expect] = cslot
+            ent = self.slots[cslot]
+        if ent[0] != 'class':
+            raise LegacyParseError(
+                f"class-ref to non-class slot {cslot} ({ent[1]}) {r.ctx()}")
+        return self._new_obj(r, ent[1])
+
+    def _new_obj(self, r, name):
+        self._as_item = self.in_entity_list
+        self.in_entity_list = False
+        slot = self.alloc(('obj', name, None))
+        reader = self.readers.get(name)
+        if reader is None:
+            raise LegacyParseError(f"no reader for class {name} {r.ctx()}")
+        prev_class = self.current_class
+        prev_slot = self.current_obj_slot
+        self.current_class = name
+        self.current_obj_slot = slot
+        try:
+            value = reader(self, r)
+        finally:
+            self.current_class = prev_class
+            self.current_obj_slot = prev_slot
+        self.slots[slot] = ('obj', name, value)
+        if name in ('CDimensionLinear', 'CText'):
+            self.annot_watermark = self.next_slot
+        return slot, name, value
+
+    def _translate_ref(self, slot):
+        """Map a FILE store-map index to the walker's numbering through the
+        burn bands. Returns the walker slot, or ``None`` when the reference
+        points INTO a band (a phantom, never-serialized connection point)."""
+        offset = 0
+        for start, width in self.burns:
+            if slot < start:
+                break
+            if slot < start + width:
+                return None
+            offset += width
+        return slot - offset
+
+    def _backref(self, slot, r):
+        if self.burns and slot >= self.burns[0][0]:
+            walker = self._translate_ref(slot)
+            if walker is None:
+                # a phantom (burned) connection-point index — annotation
+                # metadata only; nothing was ever serialized for it
+                return slot, 'reserved', None
+            slot = walker
+        ent = self.slots.get(slot)
+        if ent is None:
+            if slot < self.walk_base:
+                # opaque reference into the unwalked pre-model region
+                # (style-region entities, image dibs, …)
+                return slot, 'premodel', None
+            raise LegacyParseError(f"back-ref to unwalked slot {slot} {r.ctx()}")
+        if ent[0] == 'class':
+            raise LegacyParseError(f"back-ref to class slot {slot} {r.ctx()}")
+        return slot, ent[1], ent[2]
+
+    # 0xffff CLayer, a class-ref to a CLayer already in class_slot, or —
+    # when ``unmatched_class_ref`` — any short 0x8000 class-ref. The last
+    # form is only for the throwaway slot-base probe, which numbers from
+    # 1<<20 so the file's 0x8000|real_slot will not match class_slot.
+    def _clayer_record_at(self, at: int, unmatched_class_ref: bool = False) -> bool:
+        if at + 2 > len(self.data):
+            return False
+        tag = struct.unpack_from('<H', self.data, at)[0]
+        if (tag == 0xFFFF and at + 12 <= len(self.data)
+                and struct.unpack_from('<H', self.data, at + 4)[0] == 6
+                and self.data[at + 6:at + 12] == b'CLayer'):
+            return True
+        lay_cs = self.class_slot.get('CLayer')
+        if lay_cs is not None and _is_class_ref(self.data, at, lay_cs):
+            return True
+        return unmatched_class_ref and (tag & 0x8000) != 0 and tag != 0xFFFF
+
+    # Colour CLayer ends in a 21-byte tail. Some v18 zero-material files
+    # (custom tag listed first, then Layer0) write 12 zero bytes + u32
+    # after that, then another CLayer. Skip those 16 bytes only when they
+    # precede a CLayer; leave a definition-list back-ref alone.
+    def _skip_clayer_colour_ext(self, r: _R) -> None:
+        pad, ext = 12, 16
+        if r.pos + ext + 2 > len(self.data):
+            return
+        if any(self.data[r.pos + i] != 0 for i in range(pad)):
+            return
+        if self._clayer_record_at(r.pos + ext, True):
+            r.pos += ext
+
+    # v18 template Layer0 after a custom tag: <parent u16><active u16><dc
+    # u32>. Consume parent only when both u16s are already CLayer objects.
+    # A lone back-ref then a definition count (usual layout) stays put.
+    def _skip_clayer_parent_ref(self, r: _R, self_slot: Optional[int]) -> None:
+        if r.pos + 4 > len(self.data) or self_slot is None:
+            return
+        a = struct.unpack_from('<H', self.data, r.pos)[0]
+        b = struct.unpack_from('<H', self.data, r.pos + 2)[0]
+        if not a or (a & 0x8000) or a == 0x7FFF or a == self_slot:
+            return
+        if not b or (b & 0x8000) or b == 0x7FFF:
+            return
+        ea = self.slots.get(a)
+        eb = self.slots.get(b)
+        if ea is None or eb is None:
+            return
+        if ea[0] == 'class' or eb[0] == 'class':
+            return
+        if ea[1] != 'CLayer' or eb[1] != 'CLayer':
+            return
+        r.pos += 2
+
+    # Extra CLayer records past declared layer_count (v18: count=1 custom
+    # tag, then Layer0). Skip null separators; stop at the definition-list
+    # anchor. ``unmatched_class_ref`` only on the throwaway probe.
+    def _collect_trailing_layers(self, r: _R, slots_out=None, layers_out=None,
+                                 unmatched_class_ref: bool = False) -> None:
+        while r.pos + 2 <= len(self.data):
+            tag = r.peek_u16()
+            if tag == 0:
+                r.pos += 2
+                continue
+            if not self._clayer_record_at(r.pos, unmatched_class_ref):
+                break
+            s, _, v = self.read_object(r, expect='CLayer')
+            if v is not None:
+                if slots_out is not None:
+                    slots_out.append(s)
+                if layers_out is not None:
+                    layers_out.append((s, v))
+
+
+def _plausible_list_tag(ar, data, at) -> bool:
+    """True when the u16 at ``at`` can legally start an object read: a
+    null, an escape, a class definition, a class-ref to a KNOWN class, or
+    an object back-ref within the allocated range."""
+    if at + 2 > len(data):
+        return False
+    t = struct.unpack_from('<H', data, at)[0]
+    if t in (0x0000, 0x7FFF, 0xFFFF):
+        return True
+    if t & 0x8000:
+        ent = ar.slots.get(t & 0x7FFF)
+        return ent is not None and ent[0] == 'class'
+    return t < ar.next_slot
+
+
+def _retry_count_after_v20_filler(r: _R, count_pos: int, limit: int, ar=None) -> Optional[int]:
+    """SketchUp 2020 (v20) writes an extra, undocumented record ahead of some
+    counts that v17 does not have, which leaves the reader a few bytes early
+    and makes it read garbage as the count. The filler is an empty UTF-16
+    string record followed by zero padding:
+
+        <ff fe ff> <u8 0>        empty string
+        <zero padding>           runs up to the real count
+
+    Rather than hard-code an offset (the number of bytes before the marker
+    differs per call site), locate the marker in the short window ahead,
+    then take the first non-zero u32 that follows the padding. Only the
+    EMPTY-string form counts as filler: a real string here would mean
+    genuine data, and moving the cursor past it would corrupt the parse.
+
+    This only ever runs after a count came back implausible (or zero), so
+    files that were already parsing (v17, and the VFF path) never reach it.
+
+    *count_pos* is the offset the count was read FROM (i.e. ``r.pos - 4``).
+
+    *limit* is the caller's own plausibility ceiling for whatever count this
+    is (e.g. 100,000 for a relationship count, 1,000,000 for a definition
+    count) - required, not a shared internal default, since a candidate this
+    function accepts is returned directly with no further check at most call
+    sites. A single hardcoded ceiling here previously let a byte-garbage
+    candidate between a tighter caller's real limit and that hardcoded value
+    win the search over a better/correct candidate at a different offset,
+    causing the caller's own downstream check to fail on an otherwise-valid
+    file (found 2026-08-28, cross-language audit against TypeScript/.NET/
+    Dart/C++, which always passed their own caller-specific limit through).
+
+    Returns the corrected count, or ``None`` when this is not the v20 layout.
+    """
+    data = r.data
+    marker_at = -1
+    for i in range(count_pos, min(count_pos + 12, len(data) - 3)):
+        if data[i:i + 3] == _STR_MARKER:
+            marker_at = i
+            break
+    if marker_at < 0:
+        return None
+    if data[marker_at + 3] != 0:          # non-empty string: real data
+        return None
+
+    # Skip the zero padding that follows the empty string. The count's
+    # LOW byte is usually the first non-zero byte after the padding — but
+    # a count divisible by 256 (e.g. 4608 entities) has a zero low byte,
+    # which the padding run swallows. Try the first non-zero byte and up
+    # to three positions before it, taking the first candidate that is
+    # plausible AND is followed by a legitimate list tag.
+    at = marker_at + 4
+    while at < len(data) and data[at] == 0:
+        at += 1
+    for back in range(0, 4):
+        at2 = at - back
+        if at2 < marker_at + 4 or at2 + 4 > len(data):
+            continue
+        count = struct.unpack_from('<I', data, at2)[0]
+        if not (0 < count <= limit):
+            continue
+        if ar is not None and not _plausible_list_tag(ar, data, at2 + 4):
+            continue
+        r.pos = at2 + 4
+        return count
+    return None
+
+
+def _v20_filler_before_empty_root(data: bytes, count_pos: int) -> Optional[int]:
+    """The SketchUp 2020 layout of a model with NO component definitions AND no
+    root entities. ``_retry_count_after_v20_filler`` cannot see it: behind the
+    filler (an empty string record, then 13 bytes of padding) the only count is
+    the ROOT entity count, and it is 0, which that search skips as "no count".
+
+    Returns the offset of that root count (so the caller can put the cursor
+    there and read the zero), or ``None`` when the bytes are not that layout:
+    the empty string record has to sit within 12 bytes of *count_pos*, and the
+    13 padding bytes and the count behind it have to be all zero.
+    """
+    for i in range(count_pos, min(count_pos + 12, len(data) - 3)):
+        if data[i:i + 3] == _STR_MARKER:
+            break
+    else:
+        return None
+    if data[i + 3] != 0:                  # non-empty string: real data
+        return None
+    root_count_at = i + 4 + 13
+    if root_count_at + 4 > len(data) or any(data[i + 3:root_count_at + 4]):
+        return None
+    return root_count_at
+
+
+# ── shared record blocks ─────────────────────────────────────────────────
+
+def _is_class_ref(data: bytes, p: int, slot: int) -> bool:
+    """True when the bytes at *p* are an MFC class-ref to class *slot*.
+
+    Mirrors both encodings that ``_Archive.read_object`` decodes: the short
+    16-bit form ``0x8000|slot`` and, for slots at or past 0x7FFF, the
+    big-tag escape ``0x7FFF`` followed by a u32 of ``0x80000000|slot``.
+    ``slot == 0x7FFF`` is deliberately excluded from the short form even
+    though it fits in 15 bits: ``0x8000 | 0x7FFF == 0xFFFF``, which
+    ``read_object`` checks for "new class declaration" before it ever
+    checks the class-ref high bit - a real encoder can never emit the
+    short form for exactly that slot, so this predicate must not expect
+    it either.
+    """
+    if slot < 0x7FFF:
+        return (p + 2 <= len(data)
+                and struct.unpack_from('<H', data, p)[0] == 0x8000 | slot)
+    return (p + 6 <= len(data)
+            and struct.unpack_from('<H', data, p)[0] == 0x7FFF
+            and struct.unpack_from('<I', data, p + 2)[0] == 0x80000000 | slot)
+
+
+def _preamble(ar, r):
+    """Entity preamble: attribute pointer (+ pid mask/bytes on 2017+)."""
+    slot, name, attrs = ar.read_object(r, expect='CAttributeContainer')
+    pid = 0
+    if ar.has_pid:
+        mask = r.u8()
+        for bit in range(8):
+            if mask & (1 << bit):
+                pid |= r.u8() << (8 * bit)
+    return {'attrs': attrs, 'pid': pid, 'attrs_slot': slot}
+
+
+# SketchUp 3 (header "{3.0.x}") predates several fields every later file
+# carries. The differences below are gated on ``ar.ver < _FIRST_V4`` and were
+# calibrated byte-by-byte on one real SketchUp-written V3 file (a synthetic
+# model saved down through SketchUp's own version export) - not on a corpus -
+# so they are exactly what that file proves and no more. SketchUp 4 needs
+# none of them: a real V4 file already parses with the later layout.
+_FIRST_V4 = 4
+
+# The texture image became a first-class CDib object (store-map slot, entity
+# preamble) in SketchUp 6. SketchUp 3, 4 and 5 write it as a bare inline
+# subtype/length/bytes record straight after the material's flag word.
+_FIRST_DIB_OBJECT = 6
+
+# First version whose instances and groups carry a name string (SketchUp 3 and
+# 4 files have none; where the name is optional the reader checks for one).
+_FIRST_NAMED_INSTANCE = 5
+
+
+def _early_preamble(ar, r):
+    """``_preamble`` for the entity types that carry NO attribute-container
+    pointer in a SketchUp 3 file: vertex, loop, edge-use, material, layer.
+    (Edge, face, definition, instance and thumbnail still open with one.)"""
+    if ar.ver < _FIRST_V4:
+        return {'attrs': None, 'pid': 0}
+    return _preamble(ar, r)
+
+
+def _drawbase(ar, r):
+    # SketchUp 3's draw block is 5 bytes, and they were identical for every
+    # entity in the calibration file - painted and unpainted faces, edges,
+    # groups - so nothing in them is decodable from what we have. Material
+    # comes from the face's own pointer instead (see _read_face); report the
+    # rest as unset rather than the meaningless 0x0100 / "hidden" the 8-byte
+    # layout would read out of them.
+    b = r.raw(5 if ar.ver < _FIRST_V4 else (7 if ar.ver < 5 else 8))
+    # The layer field is normally a u16 id, but an entity can carry the
+    # layer BY OBJECT instead (seen on real 2018 instances): a full
+    # inline CLayer record on first use, an escaped back-ref to it on
+    # later siblings. Layer ids never have the 0x8000 bit and never
+    # equal 0x7FFF, so both object forms are unambiguous. (A 2-byte
+    # back-ref would collide with the id space — not seen in any file;
+    # by-object layers have only appeared in >32k-object archives where
+    # refs escape anyway.)
+    lay_cls = ar.class_slot.get('CLayer')
+    tag = r.peek_u16()
+    if lay_cls is not None and tag == (0x8000 | lay_cls):
+        ar.read_object(r, expect='CLayer')
+        layer = 0                    # by-object layer: keep the default id
+    elif tag == 0x7FFF:
+        r.u16()
+        big = r.u32()
+        if big & 0x80000000:
+            raise LegacyParseError(f"drawbase layer: unexpected class {r.ctx()}")
+        layer = 0                    # by-object layer (back-ref)
+    else:
+        layer = r.u16()
+    if ar.ver < _FIRST_V4:
+        return {'mat': 0, 'hidden': 0, 'soft': 0, 'smooth': 0, 'layer': layer}
+    return {'mat': struct.unpack_from('<H', b, 0)[0],
+            'hidden': b[2], 'soft': b[5], 'smooth': b[6],
+            'layer': layer}
+
+
+# ── entity readers ───────────────────────────────────────────────────────
+
+def _read_vertex(ar, r):
+    _early_preamble(ar, r)
+    return {'k': 'vertex', 'xyz': r.f64s(3)}
+
+
+def _read_edge(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    s1, _, _ = ar.read_object(r, expect='CVertex')
+    s2, _, _ = ar.read_object(r, expect='CVertex')
+    cs, cn, cv = ar.read_object(r)
+    if cn not in (None, 'CCurve', 'CArcCurve'):
+        raise LegacyParseError(f"edge curve pointer resolved to {cn} {r.ctx()}")
+    # Keep the curve object's VALUE, not just its
+    # slot. An arc's CArcCurve is serialized on first reference and every
+    # later edge back-refs it, so the first edge of an arc carries the only
+    # inline copy of the frame -- this third return value was thrown away
+    # here, which is why ARC.SKP's arc decoded to a frame that nothing could
+    # reach (the definition/root entity lists never contain the CArcCurve
+    # itself, only the edges pointing at it).
+    return {'k': 'edge', 'db': db, 'curve': cs, 'curve_value': cv,
+            'v1': s1, 'v2': s2}
+
+
+def _read_curve(ar, r):
+    _preamble(ar, r)
+    r.u8()
+    n = r.u32()
+    return {'k': 'curve', 'n': n}
+
+
+def _read_arccurve(ar, r):
+    """``CArcCurve`` (schema 3) - a Curve that is one analytic arc.
+
+    The 14 doubles below used to be read and
+    thrown away (``r.f64s(14)`` with no binding), so every arc in a classic
+    file arrived downstream as its tessellated chords and nothing else.
+
+    Layout, decoded against the COLLADA oracle in
+    ``hew3d/openskp``'s ``corpus/2017/arc.skp`` + ``arc.dae`` (SketchUp
+    17.3.116's own export of the same file, an independent reading):
+
+        center[3], normal[3], x_axis[3], start_angle, end_angle, y_axis[3]
+
+    with the curve being ``P(t) = center + cos(t)*x_axis + sin(t)*y_axis``
+    for ``t`` from ``start_angle`` to ``end_angle``. ``x_axis``/``y_axis``
+    are the parameterisation vectors - for a circle they are perpendicular
+    and both of length R, but they need not be: a SketchUp arc that has been
+    non-uniformly scaled keeps its arc identity and stores an affine image of
+    the circle, where ``|x_axis| != |y_axis|`` and the two are not
+    perpendicular (measured on ``gondola_v20.skp``: 105.25 vs 56.51 inches at
+    106 degrees). ``normal`` is then ``normalize(x_axis cross y_axis)``, not
+    the other way round - that relation held to 0.0 on all 17 circular
+    records in the corpus and to 1e-17 on the elliptical ones.
+
+    A full circle stores ``start_angle == end_angle`` (circle.skp: 0, 0);
+    a semicircle stores (0, pi) (arc.skp), a quarter (0, pi/2)
+    (create_reference/arc.skp).
+
+    Same field names as skppy's ``ArcGeometry`` (skppy/parser/entities.py,
+    ``_parse_radial_dimensions``), which decodes the identical 14 doubles
+    from a radial dimension's inline arc - two implementations, one layout.
+
+    Only schema 3 is decoded; there is no pre-2015 arc in the corpus to
+    validate schema 2 against and a changed layout must not be guessed at.
+    """
+    _preamble(ar, r)
+    r.raw(5)
+    v = r.f64s(14)
+    return {'k': 'arccurve', 'params': {
+        'center': tuple(v[0:3]), 'normal': tuple(v[3:6]),
+        'x_axis': tuple(v[6:9]),
+        'start_angle': v[9], 'end_angle': v[10],
+        'y_axis': tuple(v[11:14]),
+    }}
+
+
+def _register_burn(ar, delta):
+    """Record that the writer burned ``delta`` store-map indices without
+    serializing any bytes for them.
+
+    SketchUp maps an annotation's connection-point objects into the MFC
+    store map (CArchive::MapObject) when a dimension or leader text is
+    attached to geometry — each mapping consumes an index, but nothing is
+    written to the stream, so the file's later back-references run ahead
+    of a byte-exact walk. The band starts right after the last annotation
+    record (in FILE numbering); registrations never move — _backref
+    translates file references through the recorded bands instead, so no
+    slot value captured anywhere can go stale."""
+    ar.burns.append((ar.annot_watermark + ar.cum_delta, delta))
+    ar.cum_delta += delta
+    ar.annot_watermark = None
+    # each burn event corresponds to ONE phantom top-level entity that the
+    # entity list's declared count includes but the stream never carries —
+    # credit it so the list doesn't run past its real end
+    if ar.burn_stack:
+        ar.burn_stack[-1] += 1
+
+
+def _read_edgeuse(ar, r):
+    _early_preamble(ar, r)
+    es, _, _ = ar.read_object(r, expect='CEdge')
+    sense = r.u8()
+    # parent-loop back-ref: the alignment oracle. Read as a RAW file index
+    # — after annotations the claimed index can sit AHEAD of the walker's
+    # numbering (burned MapObject indices, see _register_burn), which is a
+    # correction signal, not a mis-parse.
+    p0 = r.pos
+    tag = r.u16()
+    if tag == 0x7FFF:
+        ps = r.u32()
+        if ps & 0x80000000:
+            raise LegacyParseError(f"edge-use parent is a new object {r.ctx()}")
+    elif tag == 0xFFFF or tag & 0x8000:
+        raise LegacyParseError(f"edge-use parent is a new object {r.ctx()}")
+    else:
+        ps = tag if tag else None
+    expected = (ar.current_loop + ar.cum_delta
+                if ar.current_loop is not None else None)
+    if ps != expected:
+        delta = (ps - expected
+                 if isinstance(ps, int) and expected is not None else 0)
+        if 0 < delta <= 4096 and ar.annot_watermark is not None:
+            _register_burn(ar, delta)
+        else:
+            r.pos = p0
+            raise LegacyParseError(
+                f"edge-use parent slot {ps} != current loop {expected} {r.ctx()}")
+    return {'k': 'edgeuse', 'edge': es, 'sense': sense}
+
+
+def _read_loop(ar, r):
+    my_slot = ar.next_slot - 1
+    prev = ar.current_loop
+    ar.current_loop = my_slot
+    _early_preamble(ar, r)
+    r.raw(2)                         # 2 flag bytes
+    uses = []
+    while True:
+        if r.peek_u16() == 0:
+            r.pos += 2
+            break
+        _, _, v = ar.read_object(r, expect='CEdgeUse')
+        uses.append(v)
+    ar.current_loop = prev
+    return {'k': 'loop', 'uses': uses}
+
+
+def _read_face(ar, r):
+    pre = _preamble(ar, r)
+    db = _drawbase(ar, r)
+    attrs = pre['attrs']
+    if (ar.ver < _FIRST_V4 and isinstance(attrs, dict)
+            and attrs.get('k') == 'material'):
+        # SketchUp 3: the pointer that opens a face is its FRONT MATERIAL
+        # (null for an unpainted face), not an attribute container.
+        db['mat'] = pre['attrs_slot']
+        attrs = None
+    plane = r.f64s(4)
+    nloops = r.u32()
+    if nloops > 10000:
+        raise LegacyParseError(f"implausible loop count {nloops} {r.ctx()}")
+    loops = []
+    for _ in range(nloops):
+        _, _, v = ar.read_object(r, expect='CLoop')
+        loops.append(v)
+    # NOTE: edges first inlined inside this face's loops appear right after
+    # the back-material word as redundant back-ref LIST ITEMS (they carry
+    # the edges' entity-list entries) — the list loop consumes them.
+    back_mat = r.u16()
+    return {'k': 'face', 'db': db, 'plane': plane, 'loops': loops,
+            'back_mat': back_mat, 'attrs': attrs}
+
+
+def _read_attr_container(ar, r):
+    _preamble(ar, r)
+    children = []
+    while True:
+        if r.peek_u16() == 0:
+            r.pos += 2
+            break
+        _, n, v = ar.read_object(r, expect='CAttributeNamed')
+        children.append((n, v))
+    return {'k': 'attrs', 'children': children}
+
+
+def _read_attr_named(ar, r):
+    _preamble(ar, r)
+    r.raw(4)
+    dictname = r.utf16()
+
+    def read_typed(t):
+        if t == 0x00:
+            return None
+        if t == 0x04:
+            return struct.unpack('<i', r.raw(4))[0]
+        if t == 0x06:
+            return r.f64()
+        if t == 0x07:
+            return r.u8()
+        if t == 0x09:
+            return r.u32()           # time_t
+        if t == 0x0A:
+            return r.utf16()
+        if t == 0x0C:
+            return r.f64()           # Length (a double, inches)
+        if t == 0x0B:
+            n = r.u32()
+            if n > 100000:
+                raise LegacyParseError(f"implausible attr array count {r.ctx()}")
+            return [read_typed(r.u8()) for _ in range(n)]
+        if t == 0x11:
+            return r.f64s(3)         # 3D point (Geom::Point3d)
+        if t == 0x12:
+            return r.f64s(3)         # 3D vector (Geom::Vector3d)
+        raise LegacyParseError(f"unknown attribute value type {t:#x} {r.ctx()}")
+
+    entries = {}
+    while True:
+        key = r.utf16()
+        if key == '':
+            break
+        entries[key] = read_typed(r.u8())
+    # CAttributeNamed's own trailing u32 (seen zero on every real file
+    # checked) is a v7+ addition - a real SketchUp 6 file ends the record
+    # at the empty-key terminator with no trailer at all. Reading it
+    # unconditionally eats 4 bytes that belong to the START of whatever
+    # follows (a sibling entity's own tag), which doesn't raise here - it
+    # just hands a corrupted tag to the walker a few reads later, surfacing
+    # as an unrelated "back-ref to unwalked slot" deep in the object graph
+    # (openskp#284's V6 signature). CAttributeNamed's class is always
+    # learned from the unwalked pre-model region (see _new_of_class), so
+    # its own schema is never observed and can't gate this - the file's
+    # own version number is the only signal available, same as the
+    # instance GUID gate below.
+    if ar.ver >= 7:
+        r.u32()
+    return {'k': 'dict', 'name': dictname, 'entries': entries}
+
+
+def _read_layer(ar, r):
+    _early_preamble(ar, r)
+    name = r.utf16()
+    mid = b''
+    while len(mid) < 8 and r.peek(3) != _STR_MARKER:
+        mid += r.raw(1)              # flags: 3 bytes on v16, 4 on v17+
+    r.utf16()                        # internal name ("Layer_<name>")
+    flags = r.u16()
+    if flags & 0x00FF:
+        # Colour-by-layer with a TEXTURED material: instead of the flat
+        # RGBA, the layer embeds the same texture block a CMaterial
+        # carries (SketchUp Pro assigns full materials to layers). Low
+        # byte of the flag word set = textured; a plain colour layer has
+        # 0 there (its high byte carries an unrelated flag, so the word
+        # as a whole is non-zero either way).
+        tex = _texture_block(ar, r)
+        r.raw(4)                     # trailing u32
+        return {'k': 'layer', 'name': name, 'hidden': mid[0] if mid else 0,
+                'rgba': tex['rgba']}
+    rgba = r.raw(4)
+    r.utf16()
+    r.raw(17 if ar.ver < _FIRST_V4 else 21)  # SketchUp 3's tail is 4 bytes shorter
+    ar._skip_clayer_colour_ext(r)
+    ar._skip_clayer_parent_ref(r, ar.current_obj_slot)
+    return {'k': 'layer', 'name': name, 'hidden': mid[0] if mid else 0,
+            'rgba': tuple(rgba)}
+
+
+def _texture_block(ar, r):
+    """The textured-material payload: an embedded CDib plus applied size,
+    source file name, average colour, and opacity. Shared verbatim between
+    a CMaterial with a texture and a colour-by-layer CLayer that carries a
+    textured material.
+
+    The texture is an entity in its own right, so right after the u8 "has
+    texture" flag it opens with the standard entity preamble: an
+    attribute-container ref (null unless an extension stored a dictionary
+    on the Texture itself, as render plugins do) and, from v17 on, the
+    persistent-id mask. Callers read the flag as a u16, so step back over
+    its high byte - the first byte of that preamble.
+
+    SketchUp 3 has neither: the image follows the flag directly as a bare
+    subtype/length/bytes record - no preamble, no object tag, and so no
+    store-map slot (``tex_dib`` is ``None``; the bytes ride along as
+    ``tex_data`` instead)."""
+    if ar.ver < _FIRST_DIB_OBJECT:
+        s = None
+        dib = _read_dib(ar, r)
+    else:
+        r.pos -= 1
+        _preamble(ar, r)
+        s, n, dib = ar.read_object(r, expect='CDib')
+        if not (isinstance(dib, dict) and dib.get('k') == 'dib'):
+            raise LegacyParseError(f"texture object is not a dib {r.ctx()}")
+    # optional u32 between the dib and the 2 x f64 applied size
+    marker = r.data.find(_STR_MARKER, r.pos, r.pos + 28)
+    if marker - r.pos == 20:
+        r.u32()
+    elif marker - r.pos != 16:
+        raise LegacyParseError(f"texture size block misaligned {r.ctx()}")
+    w = r.f64()
+    h = r.f64()
+    fname = r.utf16()
+    avg = r.raw(9)               # image average RGBA + 00 + the material's paint RGBA
+    r.utf16()
+    blob = r.raw(8)              # u32 material type (1 textured, 2 colorized) + u32 colorize mode
+    opacity = r.f64()
+    use_op = r.u8()
+    # Checked against materials written by SketchUp's own library: the first
+    # blob u32 is SUMaterialGetType (2 = a colorized texture, which keeps the
+    # ORIGINAL image and stores the tint as the paint colour) and the second is
+    # SUMaterialGetColorizeType (0 shift, 1 tint). The alpha byte of the image
+    # average says nothing about either - it is 0xFF on plain textures too.
+    colorized = blob[0] == 2
+    return {'rgba': (avg[5], avg[6], avg[7], 255), 'opacity': opacity, 'use_opacity': use_op,
+            'tex_dib': s, 'tex_data': dib['data'] if s is None else None,
+            'tex_w': w, 'tex_h': h, 'tex_file': fname,
+            'colorized': colorized, 'colorize_type': 1 if blob[4] == 1 else 0}
+
+
+def _read_material(ar, r):
+    _early_preamble(ar, r)
+    name = r.utf16()
+    texflag = r.u16()
+    out: Dict[str, Any] = {'k': 'material', 'name': name}
+    if texflag == 0:
+        rgba = r.raw(4)
+        r.utf16()                    # texture path (empty)
+        r.raw(8)
+        opacity = r.f64()
+        use_op = r.u8()
+        out.update(rgba=tuple(rgba), opacity=opacity, use_opacity=use_op)
+    else:
+        out.update(_texture_block(ar, r))
+    return out
+
+
+def _read_dib(ar, r):
+    subtype = r.u32()
+    length = r.u32()
+    if length > len(r.data):
+        raise LegacyParseError(f"implausible dib length {length} {r.ctx()}")
+    data = r.raw(length)
+    return {'k': 'dib', 'subtype': subtype, 'data': data}
+
+
+def _read_ftc(ar, r):
+    """CFaceTextureCoords: texture-mapping matrices + pins. The two trailing
+    u32s are per-side flags: bit 0 = side painted/positioned, bit 1 =
+    texture PROJECTED (e.g. the Add Location terrain drape — its UVs run in
+    the projection plane, not the face frame)."""
+    _preamble(ar, r)
+    r.u32()
+    ks = r.f64s(24)
+    front_pins = [r.f64s(4) for _ in range(r.u32())]
+    back_pins = [r.f64s(4) for _ in range(r.u32())]
+    fflags = r.u32()
+    bflags = r.u32()
+    return {'k': 'ftc', 'front': ks[0:9], 'back': ks[12:21],
+            'front_pins': front_pins, 'back_pins': back_pins,
+            'front_projected': bool(fflags & 2),
+            'back_projected': bool(bflags & 2)}
+
+
+def _read_camera(ar, r):
+    r.raw(137)
+    r.u16()
+    r.utf16()
+    r.raw(33 if ar.ver >= 6 else 10)
+    return {'k': 'camera'}
+
+
+def _read_thumbnail(ar, r):
+    _preamble(ar, r)
+    if ar.ver < _FIRST_V4:
+        # SketchUp 3: a fixed 129-byte camera block, no name, no image.
+        r.raw(129)
+        return {'k': 'thumbnail', 'dib': None}
+    ar.read_object(r, expect='CCamera')
+    if ar.ver < 6:
+        # SketchUp 4 and 5 end the thumbnail with its camera: no trailing
+        # image pointer (not even a null one).
+        return {'k': 'thumbnail', 'dib': None}
+    _, _, dib = ar.read_object(r, expect='CDib')
+    return {'k': 'thumbnail', 'dib': dib}
+
+
+def _read_image(ar, r):
+    """CImage: an Image entity — instance-shaped: a back-ref to the
+    (already walked) CComponentDefinition holding the image's face and
+    texture, a 3x4 placement, a constant 1.0, the source path string
+    (empty in every sample), and a 16-byte GUID. It appears as a normal
+    entity-list item inside the definition that owns the image (typically
+    a face-me/photo definition), whose own tail the ordinary definition
+    reader then consumes. Calibrated byte-exact on two real files — an
+    80 MB v18 and a 661 MB v17 — both previously rejected outright with
+    "no reader for class CImage"."""
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    ds, dn, _ = ar.read_object(r)             # the image's definition
+    xform = r.f64s(12)
+    r.f64()                                    # constant 1.0
+    r.utf16()                                  # source path
+    guid = r.raw(16)
+    return {'k': 'image', 'db': db, 'def': ds, 'xform': xform,
+            'guid': guid.hex().upper()}
+
+
+def _read_relationship(ar, r):
+    # two object pointers (small maps: two u16 back-refs — which read like
+    # the "u32" of the public notes; big maps escalate them to big-tags).
+    # They bind an annotation to the entity it labels, and the annotation
+    # side is routinely serialized BEFORE the geometry side — so these can
+    # point forward, past the walk cursor; _entity_ref tolerates that
+    # where read_object's back-ref path (rightly) does not.
+    _preamble(ar, r)
+    a = _entity_ref(ar, r)
+    b = _entity_ref(ar, r)
+    return {'k': 'relationship', 'refs': (a, b)}
+
+
+def _strict_next_tag(ar, data, at, allow_null=True) -> bool:
+    """True when the u16 at ``at`` starts an object read in one of the
+    UNAMBIGUOUS forms: null, escape, class definition, or a class-ref to a
+    class already known. Plain object back-refs are excluded on purpose —
+    any 2-byte junk below 0x8000 would qualify, which is exactly the
+    ambiguity this check exists to avoid."""
+    if at + 2 > len(data):
+        return False
+    t = struct.unpack_from('<H', data, at)[0]
+    if t == 0x0000:
+        return allow_null
+    if t in (0x7FFF, 0xFFFF):
+        return True
+    if t & 0x8000:
+        ent = ar.slots.get(t & 0x7FFF)
+        return ent is not None and ent[0] == 'class'
+    return False
+
+
+def _read_constructionline(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    point = r.f64s(3)
+    direction = r.f64s(3)
+    # Signed distance along `direction` from `point` marking where the
+    # visible segment starts/ends - ground truth (real SketchUp 2025,
+    # SDK/Ruby cross-checked, 2026-09): a bounded segment's start/end
+    # exactly equal `point`/`direction` scaled by these two parameters
+    # (verified against Sketchup::ConstructionLine#start/#end/#direction
+    # byte-for-byte, including the segment LENGTH as end_param); an
+    # unbounded direction uses a ±1e30 sentinel, matching
+    # Sketchup::ConstructionLine#start/#end returning nil for that side.
+    start_param, end_param = r.f64s(2)
+    # The trailing block varies by the WRITING BUILD, not cleanly by
+    # version: 7 bytes on the v17 calibration corpus, 4 on v16 and on a
+    # real v18, 0 on another real v17 (also 0 on a real SketchUp 2025
+    # build). Self-calibrate on the first guide line of the file — the
+    # length that lands on a legitimate next tag (strict forms only) — and
+    # cache it for the rest of the file.
+    k = getattr(ar, '_cline_tail', None)
+    if k is None:
+        default = 7 if ar.ver == 17 else 4
+        order = [default] + [c for c in (0, 4, 7) if c != default]
+        # Strong tags first (escape / known class / class definition). A
+        # following entity at +4 or +7 is unambiguous. The weak (null) pass
+        # is the last-in-list case: a construction line that is the last
+        # entity in a CComponentDefinition is followed by nrel=0, which
+        # looks like a null tag at every candidate including v17's preferred
+        # 7. Preferring 7 there swallows three bytes of the definition tail
+        # and then caches that 7 for every later guide in the file - this
+        # project's own writer (and real SketchUp 2025) uses a 4-byte
+        # trailer, so the weak pass prefers 4.
+        k = None
+        for cand in order:
+            if _strict_next_tag(ar, r.data, r.pos + cand, allow_null=False):
+                k = cand
+                break
+        if k is None:
+            for cand in (4, 0, 7):
+                if _strict_next_tag(ar, r.data, r.pos + cand, allow_null=True):
+                    k = cand
+                    break
+        if k is None:
+            k = 4
+        ar._cline_tail = k
+    r.raw(k)
+    huge = 1e20  # well below the real ±1e30 sentinel, far above any real geometry extent
+    start = None if abs(start_param) >= huge else tuple(
+        point[i] + direction[i] * start_param for i in range(3))
+    end = None if abs(end_param) >= huge else tuple(
+        point[i] + direction[i] * end_param for i in range(3))
+    return {'k': 'cline', 'db': db, 'point': tuple(point),
+            'direction': tuple(direction), 'start': start, 'end': end}
+
+
+def _read_constructionpoint(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    pos = r.f64s(3)
+    r.f64s(3)  # reserved/unused (observed all-zero, real SDK ground truth 2026-09) - no
+               # corresponding Sketchup::ConstructionPoint property to name it after
+    r.u8()     # reserved/unused (observed 0)
+    return {'k': 'cpoint', 'db': db, 'pos': pos}
+
+
+def _read_sectionplane(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    # optional object pointer before the plane; a real plane starts with a
+    # unit-normal component (|x| <= 1) — a tag word does not decode as one
+    first = struct.unpack_from('<d', r.data, r.pos)[0]
+    if not abs(first) <= 1.0001:
+        ar.read_object(r)
+    plane = list(r.f64s(4))
+    name = ""
+    label = ""
+    if r.peek(3) == _STR_MARKER:     # v18: name + short label
+        name = r.utf16()
+        label = r.utf16()
+    return {'k': 'sectionplane', 'plane': plane, 'name': name, 'label': label, 'db': db}
+
+
+def _read_skfont(ar, r):
+    ar.read_object(r, expect='CAttributeContainer')
+    if ar.has_pid:
+        mask = r.u8()
+        r.raw(bin(mask).count('1'))  # consume the pid bytes the mask declares
+    r.utf16()
+    r.raw(15)
+    return {'k': 'font'}
+
+
+# ── pages (scenes) ──────────────────────────────────────────────────────
+#
+# The fallback scan: _read_page_list (below) reads whole scene records and
+# runs first; this narrow scan only runs when that reader gives up on a
+# record. It supports a page whose captured flags are exactly the baseline
+# (nothing captured) or baseline + hidden-layers. Ground truth for both was
+# captured from real v17-native SketchUp saves; ``_PAGE_ALLOWED_FLAGS`` and
+# the 0x20 hidden-layers bit are empirical, not documented by SketchUp.
+_PAGE_ALLOWED_FLAGS = (0xc00, 0xc20)
+_PAGE_HIDDEN_LAYERS_BIT = 0x20
+
+
+def _skip_typed_ref(ar, r, cls_name, reader_fn):
+    """Consume one reference to an object of *cls_name* — a null tag, a
+    back-ref (value unneeded here, so left unresolved), a class-ref to an
+    already-declared class, or (rarely, if this is the class's first use
+    in the file) a fresh declaration — without relying on the referenced
+    object's slot already being known to *ar* the way ``ar.read_object``
+    requires. The page scan below runs over a region of the file the main
+    walk never visits, so back-refs into that region can't be resolved."""
+    tag = r.peek_u16()
+    if tag == 0:
+        r.u16()
+        return
+    if tag == 0xFFFF:
+        r.u16()
+        schema = r.u16()
+        namelen = r.u16()
+        if namelen > 40:
+            raise LegacyParseError("implausible class name length")
+        name = r.raw(namelen).decode('ascii')
+        if name != cls_name:
+            raise LegacyParseError(f"expected {cls_name} decl, got {name}")
+        if cls_name not in ar.class_slot:
+            ar.class_slot[cls_name] = ar.alloc(('class', cls_name, schema))
+        reader_fn(ar, r)
+        return
+    if tag & 0x8000:
+        cslot = tag & 0x7FFF
+        ent = ar.slots.get(cslot)
+        if ent is None:
+            # A class declared in a part of the file this scan never
+            # visited (this project's writer references CCamera's class
+            # this way, itself declared in the scaffold's own prefix,
+            # well before where the main walk even starts) — same
+            # "learn it from context" fallback _Archive._new_of_class
+            # already uses for the same situation.
+            ent = ('class', cls_name, None)
+            ar.slots[cslot] = ent
+        if not (ent[0] == 'class' and ent[1] == cls_name):
+            raise LegacyParseError(f"unexpected {cls_name} class-ref")
+        r.u16()
+        reader_fn(ar, r)
+        return
+    r.u16()   # plain back-ref — the referenced value isn't needed here
+
+
+def _scan_pages(data: bytes, ar) -> list:
+    """Best-effort scan for CViewPage (scene) records: name + hidden-layer
+    slot ids only, for the narrow flag combinations this reader
+    understands (see ``_PAGE_ALLOWED_FLAGS`` above).
+
+    This runs as an independent scan over the file tail (from where the
+    main entity walk stops) rather than as a sequential archive read:
+    each candidate is validated by its own local structure (a name string
+    immediately followed by an empty second string and a recognized flags
+    word) and any candidate that doesn't fully validate — an unsupported
+    flag combination, or a reference into a part of the file this scan
+    never visited — is silently skipped rather than guessed at, so a page
+    this reader can't fully understand is just absent from the result
+    instead of producing wrong data.
+    """
+    pages = []
+    pos = ar.r.pos
+    n = len(data)
+    while True:
+        idx = data.find(_STR_MARKER, pos)
+        if idx == -1:
+            break
+        pos = idx + 1
+        nlen_pos = idx + 3
+        if nlen_pos >= n:
+            break
+        nlen = data[nlen_pos]
+        if nlen == 0 or nlen > 40:
+            continue
+        name_start = nlen_pos + 1
+        name_end = name_start + 2 * nlen
+        if name_end + 7 > n:
+            continue
+        if data[name_end:name_end + 3] != _STR_MARKER or data[name_end + 3] != 0:
+            continue                                  # second name must be empty
+        flags_pos = name_end + 4
+        flags = struct.unpack_from('<I', data, flags_pos)[0]
+        if flags not in _PAGE_ALLOWED_FLAGS:
+            continue
+        name = data[name_start:name_end].decode('utf-16-le', errors='replace')
+        try:
+            r = _R(data, flags_pos + 4)
+            _skip_typed_ref(ar, r, 'CCamera', _read_camera)
+            _skip_typed_ref(ar, r, 'CDib', _read_dib)
+            hidden_ids = []
+            if flags & _PAGE_HIDDEN_LAYERS_BIT:
+                while True:
+                    save = r.pos
+                    v = r.u16()
+                    ent = ar.slots.get(v)
+                    if ent and ent[0] == 'obj' and ent[1] == 'CLayer':
+                        hidden_ids.append(v)
+                    else:
+                        r.pos = save
+                        break
+                if r.u32() != 1:
+                    raise LegacyParseError("unexpected hidden-layers marker")
+        except (LegacyParseError, struct.error, IndexError):
+            continue
+        pages.append({'name': name, 'hidden_layer_ids': hidden_ids})
+    return pages
+
+
+# ── full scene records ───────────────────────────────────────────────────
+#
+# Ground truth, all read byte-exactly by _read_page_list:
+# - the gondola_v20.skp fixture (SketchUp 2020, one scene, flags 0x1FF);
+# - SketchUp's own 3D Warehouse model "Skill Builder: Creating Section
+#   Animations with Scenes" in its SketchUp 2017 format (eight scenes,
+#   0x7F) and SketchUp 2015 saves (nine scenes, 0x7F) - not
+#   redistributable, so not committed;
+# - files written by openskp.create, which SketchUp Free opens with
+#   working scenes.
+#
+# The scene list sits in the document tail as a u32 count right before the
+# first record (which declares the CViewPage class), then one record per
+# scene, then a ref to the selected scene. A record is: the class tag | a
+# null attribute ref | (schema 13, SketchUp 2016+, only) a pid | name |
+# description | u32 capture flags | the camera (CCamera, or null) | the
+# thumbnail (CDib, or null) | (schema 13) a byte | then one section per
+# capture flag that is set:
+#
+#   0x02 style       the rendering options (length by file version, see
+#                    _RENDERING_OPTIONS_LEN) + a CSkpStyle ref or object
+#   0x04 shadows     2 bytes (schema 13: 3) + the shadow info
+#   0x08 axes        (schema 13: a flag byte +) 110 bytes
+#   0x10 hidden      a byte, u32 n, n entity refs
+#   0x20 layers      u32 n, n refs to the layers (tags) the scene hides
+#   0x40 sections    u32 n, n section-plane refs
+#
+# | 22 bytes (transition and delay time, flags) | u32 n + an n-byte PNG.
+# 0x80 and 0x100 (SketchUp 2020's split of "hidden" into geometry and
+# objects) add no section.
+#
+# Files saved through SketchUp's C API (SUModelSaveToFileWithVersion as 2017
+# to 2020) declare the class at schema 15. Measured on those files: flag
+# 0x01 is the camera, which is only there when it is set, with no CDib tag, no
+# byte after it and no thumbnail; the rendering options are 3 bytes longer;
+# the style options have two more value types (3: 2 bytes, 5: 4 bytes); and
+# the trailer is 21 bytes with no PNG after it. Built with every flag set
+# (0x1FF), so the 0x04/0x08/0x10/0x40 sections of this layout are measured,
+# not assumed. The samples only have 0x7F and 0x1FF; that a
+# section is absent when its flag is clear is this reader's assumption for
+# the others. A record it can't fully read, or flags outside 0x1FF, make
+# _read_page_list give up, and the narrow _scan_pages above takes over.
+_PAGE_DECL_RE = re.compile(rb'\xff\xff(\x0c|\x0d|\x0f)\x00\x09\x00CViewPage')
+_PAGE_KNOWN_FLAGS = 0x1FF
+# The rendering options' length by SketchUp major version, measured on the
+# model-level copy of the same block in every fixture from 2014 to 2020
+# (and in the 2020 scene); other versions aren't known, so give up there.
+_RENDERING_OPTIONS_LEN = {14: 206, 15: 206, 16: 206, 17: 206, 18: 211, 19: 212, 20: 213}
+_PAGE_AXES_LEN = 110
+_PAGE_TRAILER_LEN = 22
+_SHADOW_INFO_FIXED_LEN = 60  # after the city and country strings
+# CSkpStyle option values: type tag -> byte size
+_STYLE_VALUE_SIZES = {1: 1, 3: 2, 4: 4, 5: 4, 6: 4, 7: 8}
+
+
+def _read_tag(r):
+    """One archive tag, with the 0x7FFF escape to 32 bits resolved:
+    ``('null', 0)``, ``('decl', 0)``, ``('class', slot)`` (a new object
+    of an already-declared class) or ``('obj', slot)`` (a back-ref)."""
+    v = r.u16()
+    if v == 0:
+        return 'null', 0
+    if v == 0xFFFF:
+        return 'decl', 0
+    if v == 0x7FFF:
+        v = r.u32()
+        return ('class', v & 0x7FFFFFFF) if v & 0x80000000 else ('obj', v)
+    return ('class', v & 0x7FFF) if v & 0x8000 else ('obj', v)
+
+
+def _skip_pid(r):
+    mask = r.u8()
+    r.raw(bin(mask).count('1'))
+
+
+class _PageClasses:
+    """The classes the scene records declare or refer to: the schema each
+    was declared with and, once seen, the slot its class-refs use - every
+    class-ref to one class must carry the same slot, which catches a
+    record read from the wrong offset early."""
+
+    def __init__(self):
+        # CCamera and CDib are declared in the document prefix; the scene
+        # records only refer to them, at the schemas every v6+ file uses.
+        self.schema = {'CCamera': 5, 'CDib': 3}
+        self.slot = {}
+
+    def object(self, r, kind, slot, name):
+        """After a 'decl' or 'class' tag: the declaration's header (if
+        any); returns the schema the object was written with."""
+        if kind == 'decl':
+            schema = r.u16()
+            n = r.u16()
+            if n != len(name) or r.raw(n) != name.encode('ascii'):
+                raise LegacyParseError(f"expected a {name} declaration {r.ctx()}")
+            self.schema[name] = schema
+        elif self.slot.setdefault(name, slot) != slot:
+            raise LegacyParseError(f"{name} class-ref to another slot {r.ctx()}")
+        if name not in self.schema:
+            raise LegacyParseError(f"{name} object of an unknown schema {r.ctx()}")
+        return self.schema[name]
+
+
+def _read_page_camera(r):
+    eye = r.f64s(3)
+    target = r.f64s(3)
+    up = r.f64s(3)
+    r.f64s(2)                     # constants 1.0, 1000.0
+    perspective = r.u8()
+    fov = r.f64()
+    ortho_height = r.f64()
+    r.raw(137 - 105)
+    r.u16()
+    r.utf16()
+    r.raw(33)
+    return {'eye': eye, 'target': target, 'up': up, 'fov': fov,
+            'parallel': perspective == 0, 'ortho_height': ortho_height}
+
+
+def _skip_style(r, schema):
+    """A CSkpStyle object's body: no attributes, a pid (schema 2+), GUID,
+    a string, u32, name, description, then its options - each a u32 key
+    and a u32 count of (u32 type, value) pairs."""
+    if r.u16() != 0:
+        raise LegacyParseError(f"style with attributes {r.ctx()}")
+    if schema >= 2:
+        _skip_pid(r)
+    r.raw(16)
+    r.utf16()
+    r.u32()
+    r.utf16()
+    r.utf16()
+    for _ in range(r.u32()):
+        r.u32()
+        for _ in range(r.u32()):
+            size = _STYLE_VALUE_SIZES.get(r.u32())
+            if size is None:
+                raise LegacyParseError(f"unknown style value type {r.ctx()}")
+            r.raw(size)
+
+
+def _read_refs(r, n):
+    if n > (len(r.data) - r.pos) // 2:
+        raise LegacyParseError(f"implausible ref count {n} {r.ctx()}")
+    refs = []
+    for _ in range(n):
+        kind, v = _read_tag(r)
+        if kind != 'obj':
+            raise LegacyParseError(f"expected a back-ref {r.ctx()}")
+        refs.append(v)
+    return refs
+
+
+def _read_page_record(r, classes, ver):
+    kind, slot = _read_tag(r)
+    if kind not in ('decl', 'class'):
+        raise LegacyParseError(f"expected a CViewPage record {r.ctx()}")
+    schema = classes.object(r, kind, slot, 'CViewPage')
+    if r.u16() != 0:
+        raise LegacyParseError(f"scene with attributes {r.ctx()}")
+    if schema >= 13:
+        _skip_pid(r)
+    page = {'name': r.utf16(), 'hidden_layer_ids': []}
+    r.utf16()                                     # description
+    flags = r.u32()
+    if flags & ~_PAGE_KNOWN_FLAGS:
+        raise LegacyParseError(f"scene capture flags {flags:#x} {r.ctx()}")
+    if schema >= 15:
+        # saved through SketchUp's C API: the camera is there when its flag
+        # is, and there is no thumbnail
+        if flags & 0x01:
+            kind, slot = _read_tag(r)
+            if kind not in ('decl', 'class'):
+                raise LegacyParseError(f"expected a camera {r.ctx()}")
+            classes.object(r, kind, slot, 'CCamera')
+            page.update(_read_page_camera(r))
+    else:
+        kind, slot = _read_tag(r)
+        if kind in ('decl', 'class'):
+            classes.object(r, kind, slot, 'CCamera')
+            page.update(_read_page_camera(r))
+        kind, slot = _read_tag(r)
+        if kind in ('decl', 'class'):
+            classes.object(r, kind, slot, 'CDib')
+            _read_dib(None, r)
+        if schema >= 13:
+            r.u8()
+    if flags & 0x02:
+        if ver not in _RENDERING_OPTIONS_LEN:
+            raise LegacyParseError(f"rendering options of a v{ver} scene")
+        r.raw(_RENDERING_OPTIONS_LEN[ver] + (3 if schema >= 15 else 0))
+        kind, slot = _read_tag(r)
+        if kind in ('decl', 'class'):
+            _skip_style(r, classes.object(r, kind, slot, 'CSkpStyle'))
+    if flags & 0x04:
+        r.raw(3 if schema >= 13 else 2)
+        r.u32()                                   # time
+        r.u8()
+        r.utf16()                                 # city
+        r.utf16()                                 # country
+        r.raw(_SHADOW_INFO_FIXED_LEN)
+    if flags & 0x08:
+        r.raw(_PAGE_AXES_LEN + (1 if schema >= 13 else 0))
+    if flags & 0x10:
+        r.u8()
+        _read_refs(r, r.u32())
+    if flags & 0x20:
+        page['hidden_layer_ids'] = _read_refs(r, r.u32())
+    if flags & 0x40:
+        _read_refs(r, r.u32())
+    if schema >= 15:
+        r.raw(_PAGE_TRAILER_LEN - 1)
+        return page
+    r.raw(_PAGE_TRAILER_LEN)
+    png = r.u32()
+    if png > len(r.data) - r.pos:
+        raise LegacyParseError(f"implausible thumbnail length {png} {r.ctx()}")
+    r.raw(png)
+    return page
+
+
+def _read_page_list(data: bytes, ar):
+    """Every scene, with its camera and hidden layers, read as a sequence
+    from the scene list in the file tail. ``None`` when there is a scene
+    list this reader can't fully read (the caller then falls back to
+    _scan_pages); ``[]`` when there is none."""
+    m = _PAGE_DECL_RE.search(data, ar.r.pos)
+    if m is None:
+        # a scene list in a schema this reader doesn't know: let the
+        # narrow scan try
+        return None if data.find(b'CViewPage', ar.r.pos) >= 0 else []
+    try:
+        count = struct.unpack_from('<I', data, m.start() - 4)[0]
+        if not 1 <= count <= 10000:
+            raise LegacyParseError(f"implausible scene count {count}")
+        r = _R(data, m.start())
+        classes = _PageClasses()
+        pages = [_read_page_record(r, classes, ar.ver) for _ in range(count)]
+        # the list ends with a ref to the selected scene (or a null ref)
+        if _read_tag(r)[0] not in ('obj', 'null'):
+            raise LegacyParseError(f"no selected-scene ref after the scenes {r.ctx()}")
+        for page in pages:
+            page['hidden_layer_ids'] = [
+                i for i in page['hidden_layer_ids']
+                if (ar.slots.get(i) or ('',))[0] == 'obj' and ar.slots[i][1] == 'CLayer']
+    except (LegacyParseError, struct.error, IndexError, ValueError) as e:
+        logger.debug("scene list not fully readable, falling back to the scan: %s", e)
+        return None
+    return pages
+
+
+def _entity_ref(ar, r):
+    """A reference-to-entity tag: dimension connection points and text
+    leader attachments. Unlike ``read_object``'s back-ref path, this
+    tolerates a slot the walk has not reached yet — SketchUp serializes a
+    label/dimension BEFORE the entity it anchors to when both live in the
+    same entity list, so the reference can legitimately point forward.
+    Returns the slot number, or ``None`` for a null reference."""
+    tag = r.u16()
+    if tag == 0:
+        return None
+    if tag == 0x7FFF:
+        big = r.u32()
+        if big & 0x80000000:
+            raise LegacyParseError(f"entity ref is a new object {r.ctx()}")
+        return big
+    if tag == 0xFFFF or tag & 0x8000:
+        raise LegacyParseError(f"entity ref is a new object {r.ctx()}")
+    return tag
+
+
+def _read_dimlinear(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    text = r.utf16()
+    if ar.ver >= 6:
+        ar.read_object(r, expect='CSkFont')
+    # The tail is NOT a fixed 165-byte blob: it embeds two object
+    # references (the dimension's connection points into the geometry).
+    # Each is a normal MFC tag — 2 bytes in small files, but 6 bytes once
+    # the archive holds more than 0x7FFE objects and the 0x7FFF big-tag
+    # escape kicks in — so a fixed-size skip walks off the rails exactly
+    # on large models (found on a real 17 MB SketchUp 2018 file whose
+    # dimension sat past object #517k).
+    #
+    # Each connection ref is followed by a second entity ref and two ref
+    # lists, [ref][u32 n1][n1 refs][u32 n2][n2 refs] — the INSTANCE PATHS of
+    # the anchored entity: the groups/components it lives in. A dimension
+    # on loose geometry has a null ref and two empty lists (the zeros the
+    # fixed 42/82-byte blocks used to skip, i.e. every sample that layout
+    # was written from); one anchored to a vertex inside nested groups
+    # carries a ref per group, and the fixed-size read slid off the record
+    # by exactly those refs — silently truncating the ROOT entity list
+    # after it, because the root reader stops at the first unreadable item
+    # (a SketchUp 2018 house: 70 of its 72 root entities lost, 948
+    # definitions left unplaced). Measured on 42 dimensions in 23 legacy
+    # files: every record is 161 fixed bytes plus its refs.
+    # SketchUp 4 and 5 write neither the font object above nor the 5 bytes in
+    # front of the first connection block; keep the block's later offsets
+    # the same by supplying them as zeros.
+    b37 = (b'\x00' * 5 if ar.ver < 6 else b'') + r.raw(32 if ar.ver < 6 else 37)
+    c1 = _path_ref(ar, r)            # connection point 1 (may be null; may be written in full)
+    path1 = _connection_paths(ar, r)
+    b32 = r.raw(32)
+    c2 = _path_ref(ar, r)            # connection point 2 (may be null; may be written in full)
+    path2 = _connection_paths(ar, r)
+    b72 = r.raw(72 if ar.ver >= 6 else 68)   # SketchUp 4 and 5: no trailing u32
+    # the dimension-line offset (inches, signed) sits at a fixed position
+    # of the trailing block on every sample (v17 and v18 alike)
+    offset = struct.unpack_from('<d', b72, 52)[0]
+    out = {'k': 'dimension', 'db': db, 'text': text,
+           'connect': (c1, c2), 'paths': (path1, path2), 'offset': offset}
+    # connection blocks: [.. u32 TYPE ..][u32 4][point3d]. Type 1 = a FREE
+    # point stored inline (SDK-generated ground truth); type 2 = anchored
+    # to the referenced entity, point zeroed.
+    if struct.unpack_from('<I', b37, 5)[0] == 1:
+        out['a'] = struct.unpack_from('<3d', b37, 13)
+    if struct.unpack_from('<I', b32, 0)[0] == 1:
+        out['b'] = struct.unpack_from('<3d', b32, 8)
+    return out
+
+
+def _connection_paths(ar, r):
+    """What follows a dimension connection ref (see ``_read_dimlinear``):
+    [entity ref][u32 n1][n1 refs][u32 n2][n2 refs]. Returns
+    ``(ref, refs1, refs2)``."""
+    extra = _entity_ref(ar, r)
+    lists = []
+    for _ in range(2):
+        count = r.u32()
+        if count > 1000:
+            raise LegacyParseError(
+                f"implausible dimension path length {r.ctx()}")
+        lists.append([_path_ref(ar, r, member=not i) for i in range(count)])
+    return extra, lists[0], lists[1]
+
+
+def _path_ref(ar, r, member=False):
+    """One instance of a dimension's path. Usually a reference, but MFC
+    writes an object IN FULL the first time anything points at it — and a
+    dimension serialized before the group it is anchored in carries that
+    whole group right here (the root list later holds a back-reference).
+    Read it like any object then, so it is registered and the stream stays
+    aligned; return its slot either way. A path runs from the outermost
+    instance in, so its first one (*member*) is an entity of the list the
+    annotation is in; one written here in full is noted for that list
+    (see _read_entity_list)."""
+    tag = r.peek_u16()
+    new = tag == 0xFFFF or (tag != 0x7FFF and tag & 0x8000)
+    if tag == 0x7FFF:
+        big = struct.unpack_from('<I', r.data, r.pos + 2)[0]
+        new = bool(big & 0x80000000)
+    if new:
+        slot, _name, _value = ar.read_object(r)
+        inline = getattr(ar, 'inline_stack', None)
+        if member and inline:
+            inline[-1][slot] = None
+        return slot
+    return _entity_ref(ar, r)
+
+
+def _text_delimiter(r):
+    """Where a text's string starts: the variable-length variant middle
+    ends in an 11-byte block `01 00 00 00 ?? 00 03 00 00 00 01` right
+    before it."""
+    p = r.pos
+    while True:
+        idx = r.data.find(_STR_MARKER, p, r.pos + 512)
+        if idx < 0:
+            raise LegacyParseError(f"text delimiter not found {r.ctx()}")
+        blk = r.data[idx - 11:idx]
+        arrow = struct.unpack_from('<I', blk, 6)[0]
+        if (blk[:4] == b'\x01\x00\x00\x00'
+                and arrow <= 8 and blk[10] == 1):
+            return idx               # blk[6:10] is the ARROW TYPE (0-4 seen)
+        p = idx + 3
+
+
+def _anchored_connection(data, pos):
+    """Whether the text whose font ends at *pos* is anchored to an entity:
+    after the two screen-fraction f64s comes the connection block,
+    [u32 type][u32 4][point3d], and a type other than 0 or 1 (2, 4, 5 and 7
+    seen; see docs/dimension-record-notes.md) anchors the label."""
+    if data[pos + 20:pos + 24] != b'\x04\x00\x00\x00':
+        return False
+    return 2 <= struct.unpack_from('<I', data, pos + 16)[0] <= 15
+
+
+def _read_text(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    ar.read_object(r, expect='CSkFont')
+    point = None
+    label = None
+    connect = None
+    paths = None
+    anchored = _anchored_connection(r.data, r.pos)
+    if anchored:
+        # An anchored connection block is followed, as a dimension's is
+        # (see _read_dimlinear), by the anchored entity's ref and its
+        # instance paths — and MFC writes a path instance IN FULL there
+        # when nothing has pointed at it before (a label anchored to a
+        # component instance serialized after it, its class declaration
+        # included when it is the file's first instance). Skipped as
+        # bytes, that instance never gets its store-map slots and every
+        # later reference is off by them ("class-ref to non-class slot");
+        # read it instead. The block's point is zero (types 2 and 4) or
+        # not known to be a world position (5, and 7's face fractions), so
+        # it is not kept.
+        r.raw(16 + 32)
+        connect = _entity_ref(ar, r)
+        paths = _connection_paths(ar, r)
+    idx = _text_delimiter(r)
+    # A free text's block has type 1 and its anchor inline (world inches),
+    # followed by the null ref and empty paths (the 12 zero bytes below).
+    mid = r.data[r.pos:idx]
+    off = -1 if anchored else mid.find(b'\x01\x00\x00\x00\x04\x00\x00\x00')
+    if off >= 0 and off + 32 <= len(mid):
+        point = struct.unpack_from('<3d', mid, off + 8)
+        # placement tail: [12B zeros][point3d LABEL][16B zeros][f64 1.0]
+        # [u32 leader type][delimiter]; all-zero label = screen text
+        lo = off + 32 + 12
+        if lo + 24 <= len(mid):
+            lp = struct.unpack_from('<3d', mid, lo)
+            if any(abs(c) > 1e-12 for c in lp):
+                label = lp
+    r.raw(idx - r.pos)
+    text = r.utf16()
+    r.raw(5)
+    # Optional leader-attachment refs follow the fixed tail (a text label
+    # anchored to geometry stores the anchored entities here; they can
+    # point FORWARD — see _entity_ref). Only the escaped 6-byte form is
+    # recognisable without risk: a 2-byte back-ref here would be
+    # indistinguishable from the next list item's tag, and every known
+    # sample either has no attachments or lives in a >0x7FFE-object file
+    # where the escape is mandatory anyway.
+    attach = []
+    while r.peek(2) == b'\xff\x7f':
+        val = struct.unpack_from('<I', r.data, r.pos + 2)[0]
+        if val & 0x80000000:
+            break                    # new-object tag — the next entity
+        r.raw(6)
+        attach.append(val)
+    return {'k': 'text', 'text': text, 'db': db, 'attach': attach,
+            'p': point, 'lp': label, 'connect': connect, 'paths': paths}
+
+
+def _read_entity_list(ar, r, count, owner):
+    ents = []
+    ar.burn_stack.append(0)
+    ar.inline_stack.append({})
+    try:
+        ents = _read_entity_list_inner(ar, r, count, owner, ents)
+        # An instance an annotation wrote in full (see _path_ref) is one of
+        # this list's items, and the declared count holds it — but SketchUp
+        # does not always list it again with a back-reference (labels
+        # anchored to the loudspeakers of an auditorium: of five instances
+        # written in a definition's labels, three were listed again, two
+        # not). Keep the ones never listed, as the list's own entities.
+        for slot in ar.inline_stack[-1]:
+            if len(ents) < count:
+                _, name, value = ar.slots[slot]
+                ents.append((slot, name, value))
+        return ents
+    finally:
+        ar.burn_stack.pop()
+        ar.inline_stack.pop()
+
+
+def _peek_backref(ar, r):
+    """The walker slot of the back-reference at the cursor, without moving
+    it; ``None`` when the next tag is anything else."""
+    if r.pos + 2 > len(r.data):
+        return None
+    tag = struct.unpack_from('<H', r.data, r.pos)[0]
+    if tag == 0x7FFF:
+        if r.pos + 6 > len(r.data):
+            return None
+        slot = struct.unpack_from('<I', r.data, r.pos + 2)[0]
+        if slot & 0x80000000:
+            return None
+    elif tag == 0 or tag & 0x8000:
+        return None
+    else:
+        slot = tag
+    if ar.burns and slot >= ar.burns[0][0]:
+        return ar._translate_ref(slot)
+    return slot
+
+
+def _read_entity_list_inner(ar, r, count, owner, ents):
+    while len(ents) < count:
+        p = r.pos
+        inline = ar.inline_stack[-1] if ar.inline_stack else {}
+        if (inline and len(ents) + len(inline) >= count
+                and _peek_backref(ar, r) not in inline):
+            # every item left is an instance an annotation already wrote in
+            # full and the list does not list again (see _read_entity_list)
+            break
+        if (owner == 'def' and ar.burn_stack and ar.burn_stack[-1]
+                and struct.unpack_from('<I', r.data, p)[0] == 0
+                and r.data[p + 22:p + 25] == _STR_MARKER):
+            # burned MapObject indices (see _register_burn) mean the declared
+            # count includes phantom entities the stream never carries; the
+            # definition tail signature (nrel=0 + pad + 16-byte GUID + name
+            # marker at +22) marks the list's REAL end
+            break
+        prev_flag = ar.in_entity_list
+        ar.in_entity_list = True
+        try:
+            s, n, v = ar.read_object(r)
+        except LegacyParseError:
+            if owner == 'root':
+                # over-declared root counts run into the document tail — stop
+                r.pos = p
+                break
+            if owner == 'def' and ar.burn_stack and ar.burn_stack[-1]:
+                # this list had burned MapObject indices (see _register_burn):
+                # the phantom connection points were also counted as items,
+                # so the declared count overshoots the real records. Stop at
+                # the failed item — the definition tail that follows (nrel,
+                # GUID anchor, thumbnail scan) validates the cut.
+                r.pos = p
+                break
+            raise
+        finally:
+            ar.in_entity_list = prev_flag
+        inline.pop(s, None)
+        ents.append((s, n, v))
+    return ents
+
+
+def _reanchor_on_string_marker(data: bytes, pos: int) -> int:
+    """`_read_definition`'s GUID+name read assumes a fixed-width prefix: a
+    16-byte GUID immediately followed by `_STR_MARKER`. Some files skew
+    that width in either direction, leaving `pos` a few bytes off from
+    where the GUID actually starts:
+
+    - SketchUp 2020 files can carry two extra bytes ahead of the GUID
+      (prefix runs LONGER than assumed - the marker sits after `pos`).
+    - A definition imported from DWG in a SketchUp 2018 file has been
+      reported (openskp#377) to run the prefix a couple of bytes SHORTER
+      than assumed - the marker sits before `pos`. Verified by the
+      reporter against the real SketchUp SDK's own output (glTF bounding
+      boxes matched on every axis) and their own real-file regression
+      corpus, which this is unaffected by since the search only runs when
+      `pos` doesn't already land exactly on the GUID.
+
+    Searches both directions within 4 bytes, nearest offset first, and
+    returns `pos` unchanged if no match is found there (matching this
+    function's own pre-existing forward-only behavior in that case, which
+    leaves the subsequent strict read to raise instead of silently
+    trusting a wrong offset)."""
+    if data[pos + 16:pos + 19] == _STR_MARKER:
+        return pos
+    for skip in (-1, 1, -2, 2, -3, 3, -4, 4):
+        at = pos + skip
+        if at >= 0 and data[at + 16:at + 19] == _STR_MARKER:
+            return at
+    return pos
+
+
+def _read_definition(ar, r):
+    _preamble(ar, r)
+    # undecoded base block (13 bytes in SketchUp 3)
+    r.raw(22 if ar.ver >= 17 else (20 if ar.ver >= 5 else (19 if ar.ver >= _FIRST_V4 else 13)))
+    nlayers = r.u32()
+    if nlayers > 10000:
+        raise LegacyParseError(f"implausible def layer count {r.ctx()}")
+    # like the model-level layer list, the count is REAL layers (new records
+    # or back-refs); SketchUp 2020 interleaves null separators between them
+    got = 0
+    while got < nlayers:
+        if r.peek_u16() == 0:
+            r.pos += 2
+            continue
+        ar.read_object(r, expect='CLayer')
+        got += 1
+    if ar.ver == 19 and nlayers and r.peek_u16() == 0:
+        # SketchUp 2019 follows the LAST layer with a separator null too
+        # (2020 does as well, but its count recovery already absorbs it).
+        r.pos += 2
+    decl = r.u16()
+    if decl == 0x7FFF:
+        decl = r.u32()
+    # v20 can drop its undocumented filler right here, swallowing the u32
+    # field (and, behind a layer-separator null, even the decl itself): if
+    # the empty-string marker sits in the next few bytes, the real count is
+    # the first non-zero u32 after its padding.
+    count = None
+    if ar.ver >= 20:
+        count = _retry_count_after_v20_filler(r, r.pos, 5_000_000, ar)
+    if count is None:
+        r.u32()
+        count = r.u32()
+    # A zero count is as much a symptom of the v20 filler as an implausibly
+    # large one: the reader lands on the leading zero bytes of the filler
+    # instead of the count. A genuinely empty definition reads zero with no
+    # filler ahead, and _retry_count_after_v20_filler leaves those alone.
+    if count > 5_000_000 or count == 0:
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, 5_000_000, ar)
+        if retry is not None:
+            count = retry
+    if count > 5_000_000:
+        raise LegacyParseError(f"implausible def entity count {r.ctx()}")
+    ents = _read_entity_list(ar, r, count, 'def')
+    nrel = r.u32()
+    if nrel > 100000:
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, 100_000, ar)
+        if retry is not None:
+            nrel = retry
+    if nrel > 100000:
+        raise LegacyParseError(f"definition list misaligned {r.ctx()}")
+    for _ in range(nrel):
+        ar.read_object(r, expect='CRelationship')
+    r.u16()
+    r.pos = _reanchor_on_string_marker(r.data, r.pos)
+    guid = r.raw(16)
+    name = r.utf16()
+    r.utf16()
+    r.utf16()
+    r.u32()                                   # timestamp
+    # undecoded block (~39-47 bytes), then the CThumbnail object
+    tpos = None
+    thumb_slot = ar.class_slot.get('CThumbnail')
+    for off in range(0, 96):
+        p = r.pos + off
+        if (r.data[p:p + 2] == b'\xff\xff' and r.data[p + 4:p + 6] == b'\x0a\x00'
+                and r.data[p + 6:p + 16] == b'CThumbnail'):
+            tpos = p
+            break
+        if thumb_slot is not None and _is_class_ref(r.data, p, thumb_slot):
+            tpos = p
+            break
+    if tpos is None:
+        raise LegacyParseError(f"definition tail: thumbnail not found {r.ctx()}")
+    gap = r.raw(tpos - r.pos)
+    # component-behavior flags sit 9 bytes before the thumbnail:
+    # bit 0 = always-faces-camera, bit 1 = shadows-face-sun
+    behavior = gap[-9] if len(gap) >= 9 else 0
+    # the last u32 before the thumbnail is 1 for the definition of a group and
+    # 0 for a component's (what SketchUp's SUComponentDefinitionGetType
+    # reports). Checked against SketchUp 2025's own counts on gondola_v20
+    # (14 groups, 6 components) and Untitled (46 groups), and on a model with
+    # 144 groups and 1 component saved by SketchUp 3 to 2020; the CGroup
+    # record that places a definition is no substitute: openskp's own writer
+    # puts one over a component definition, which SketchUp calls a component.
+    is_group = len(gap) >= 4 and int.from_bytes(gap[-4:], 'little') == 1
+    ar.read_object(r, expect='CThumbnail')
+    return {'k': 'definition', 'name': name, 'guid': guid.hex().upper(),
+            'ents': ents, 'faces_camera': bool(behavior & 1),
+            'shadows_face_sun': bool(behavior & 2), 'is_group': is_group}
+
+
+def _read_instance(ar, r):
+    pre = _preamble(ar, r)
+    db = _drawbase(ar, r)
+    ds, dn, _ = ar.read_object(r, expect='CComponentDefinition')
+    if dn != 'CComponentDefinition':
+        raise LegacyParseError(f"instance definition ref is {dn} {r.ctx()}")
+    xf = r.f64s(13)
+    # SketchUp 3 and 4 instances carry no name string (5 is the first to
+    # write one); where it is optional, take it only if a string is there.
+    name = r.utf16() if (ar.ver >= _FIRST_NAMED_INSTANCE or r.peek(3) == _STR_MARKER) else ''
+    # The trailing instance GUID is a pre-2014 (ver < 14) thing, full stop -
+    # for BOTH CComponentInstance and CGroup, gated by real file version,
+    # not by the class's own schema number.
+    #
+    # The schema field looked plausible as a gate at first (SketchUp 2013
+    # writes CComponentInstance schema 4, which ends at the name - no
+    # GUID), but it doesn't generalize: a v7 file's root-level
+    # CComponentInstance reports schema 6, and a 2013 file's reports schema
+    # 6 as well - both well above the "5 means GUID present" threshold that
+    # comment assumed, yet neither actually carries one. Forcing the read
+    # anyway silently eats 16 bytes that belong to the START of the next
+    # root-level sibling's own tag, which doesn't raise - it just produces
+    # garbage from that point on, silently truncating the rest of the
+    # root entity list to whatever the corrupted bytes happen to decode as
+    # (confirmed on v7/v8/2013: root instance count dropped from the
+    # correct 18 to 1). CGroup has the same issue and was root-caused the
+    # same way (openskp#284): real files report schema 1 for it on every
+    # version tested (v3 through 2025), so schema can't distinguish old-
+    # from new-format CGroup there either, but forcing the GUID read on a
+    # pre-2014 CGroup eats into the next sibling's class-ref tag, producing
+    # "class-ref to non-class slot N (CAttributeNamed)" deep inside a
+    # nested definition. Both symptoms, one cause, one fix: gate on ver.
+    has_guid = ar.ver >= 14
+    if has_guid:
+        guid = r.raw(16)
+    else:
+        guid = b''
+    return {'k': 'instance', 'db': db, 'def': ds, 'xf': xf,
+            'name': name, 'guid': guid.hex().upper(), 'attrs': pre['attrs']}
+
+
+_READERS = {
+    'CVertex': _read_vertex, 'CEdge': _read_edge, 'CCurve': _read_curve,
+    'CArcCurve': _read_arccurve, 'CEdgeUse': _read_edgeuse,
+    'CLoop': _read_loop, 'CFace': _read_face, 'CLayer': _read_layer,
+    'CMaterial': _read_material, 'CDib': _read_dib,
+    'CAttributeContainer': _read_attr_container,
+    'CAttributeNamed': _read_attr_named, 'CCamera': _read_camera,
+    'CThumbnail': _read_thumbnail, 'CRelationship': _read_relationship,
+    'CComponentDefinition': _read_definition, 'CImage': _read_image,
+    'CComponentInstance': _read_instance, 'CGroup': _read_instance,
+    'CFaceTextureCoords': _read_ftc,
+    'CConstructionLine': _read_constructionline,
+    'CConstructionPoint': _read_constructionpoint,
+    'CSectionPlane': _read_sectionplane, 'CSkFont': _read_skfont,
+    'CDimensionLinear': _read_dimlinear, 'CText': _read_text,
+}
+
+
+# ── walk driver ──────────────────────────────────────────────────────────
+
+def is_legacy(data: bytes) -> bool:
+    """True when *data* is a classic (pre-2021) MFC-container ``.skp``."""
+    if not data.startswith(b'\xff\xfe\xff\x0e'):
+        return False
+    if b'PK\x03\x04' in data[:0x100]:
+        return False
+    return b'CVersionMap' in data[:0x200]
+
+
+def _walk(data: bytes):
+    ver_m = re.search(rb'\{(\d+)\.', data[:0x60].replace(b'\x00', b''))
+    if not ver_m:
+        raise LegacyParseError("no version string in header")
+    ver = int(ver_m.group(1))
+    # anchor: the material manager (u32 count right before the first
+    # CMaterial new-class record); zero-material files have no CMaterial
+    # record anywhere, so fall back to the first CLayer class record and
+    # start at the layer-list marker just before it
+    m = re.search(re.escape(b'\xff\xff') + b'..'
+                  + re.escape(struct.pack('<H', 9) + b'CMaterial'),
+                  data, re.DOTALL)
+    if m:
+        start = m.start()
+        mat_count = struct.unpack_from('<I', data, start - 4)[0]
+        if mat_count > 100000:
+            raise LegacyParseError("implausible material count")
+    else:
+        lm = re.search(re.escape(b'\xff\xff') + b'..'
+                       + re.escape(struct.pack('<H', 6) + b'CLayer'),
+                       data, re.DOTALL)
+        if not lm:
+            raise LegacyParseError("no CMaterial or CLayer class record found")
+        mat_count = 0
+        start = lm.start() - (9 if ver >= 17 else 8)
+
+    if mat_count >= 2:
+        bases = [_bootstrap_two_materials(data, ver, start)]
+    else:
+        # single-material / no-material files: derive the base from the
+        # definition-list anchor, a back-ref to the ACTIVE layer object
+        bases = _probe_layer_anchor_bases(data, ver, start, mat_count)
+
+    # Every candidate but the right one dies almost immediately (the slot
+    # numbers it hands out disagree with the file's own class-refs), while the
+    # right one only fails where the file really differs from what we know.
+    # So report the failure that got FURTHEST into the file - not the last
+    # candidate's, which is the earliest-failing one and says nothing useful.
+    best_exc = None
+    best_at = -1
+    for base in bases:
+        try:
+            return _walk_model(data, ver, start, mat_count, base)
+        except (LegacyParseError, struct.error, IndexError,
+                UnicodeDecodeError) as exc:
+            m = re.search(r'@0x([0-9a-f]+)', str(exc))
+            at = int(m.group(1), 16) if m else -1
+            if best_exc is None or at > best_at:
+                best_exc, best_at = exc, at
+    if best_exc is not None:
+        raise best_exc
+    raise LegacyParseError("no viable slot base candidate")
+
+
+def _bootstrap_two_materials(data: bytes, ver: int, mat_hdr: int) -> int:
+    """Parse material 1 with a throwaway archive; material 2's class-ref
+    tag names CMaterial's true absolute slot."""
+    boot = _Archive(data, ver)
+    boot.readers.update(_READERS)
+    boot.next_slot = 1 << 20
+    boot.walk_base = 1 << 20
+    boot.r.pos = mat_hdr
+    boot.read_object(boot.r, expect='CMaterial')
+    tag = boot.r.peek_u16()
+    if tag == 0xFFFF or not (tag & 0x8000):
+        raise LegacyParseError("cannot bootstrap the slot base")
+    return tag & 0x7FFF
+
+
+def _probe_layer_anchor_bases(data: bytes, ver: int, start: int,
+                              mat_count: int):
+    """Slot-base candidates for files where the two-material trick is
+    unavailable.
+
+    Parse the model prefix (materials, layer list) with a throwaway base;
+    the object right after the layer list is the definition-list anchor —
+    an ABSOLUTE back-ref to the active layer, an object we just allocated
+    relatively.  Each walked layer yields one candidate base; with a single
+    layer (the common case) the answer is exact.
+    """
+    boot = _Archive(data, ver)
+    boot.readers.update(_READERS)
+    b0 = 1 << 20
+    boot.next_slot = b0
+    boot.walk_base = b0
+    boot.r.pos = start
+    for _ in range(mat_count):
+        boot.read_object(boot.r, expect='CMaterial')
+    boot.r.u32()
+    if ver >= 17:
+        boot.r.u8()
+    if ver < _FIRST_V4:
+        # SketchUp 3 writes no layer count: the layer records simply run
+        # until the definition-list anchor, which _collect_trailing_layers
+        # (below) already stops at. Reading a count here would consume the
+        # first layer record and reject every single-material V3 file.
+        layer_count = 0
+    else:
+        layer_count = boot.r.u32()
+        if not 1 <= layer_count <= 100000:
+            raise LegacyParseError("implausible layer count in base probe")
+    layer_slots = []
+    for _ in range(layer_count):
+        s, _, _ = boot.read_object(boot.r, expect='CLayer')
+        layer_slots.append(s)
+    boot._collect_trailing_layers(boot.r, slots_out=layer_slots,
+                                  unmatched_class_ref=True)
+    s, n, _ = boot.read_object(boot.r)
+    if n != 'premodel':
+        # under the throwaway base every absolute back-ref classifies as
+        # premodel; anything else means the prefix did not parse
+        raise LegacyParseError(f"base probe: anchor resolved to {n}")
+    # a null entry in the layer list has no slot, so it is no candidate (files
+    # saved through SketchUp's C API as 2019 or 2020 have one)
+    return [s - (rel - b0) for rel in layer_slots
+            if rel is not None and 0 < s - (rel - b0) < b0]
+
+
+def _definition_starts_at(ar, at: int) -> bool:
+    """True when the bytes at *at* begin a CComponentDefinition record: its
+    first-use class declaration, or a class-ref to its known slot."""
+    data = ar.data
+    if data[at:at + 2] == bytes([0xFF, 0xFF]) and data[at + 6:at + 26] == b'CComponentDefinition':
+        return True
+    def_cls = ar.class_slot.get('CComponentDefinition')
+    return def_cls is not None and _is_class_ref(data, at, def_cls)
+
+
+def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
+                base: int):
+    ar = _Archive(data, ver)
+    ar.readers.update(_READERS)
+    ar.next_slot = base
+    ar.walk_base = base
+    r = ar.r
+
+    # material manager
+    r.pos = start
+    materials = []
+    for _ in range(mat_count):
+        s, _, v = ar.read_object(r, expect='CMaterial')
+        materials.append((s, v))
+
+    # layer list marker: v16 <u32 X><u32 count>, v17+ <u32 X><u8 0><u32 count>
+    r.u32()
+    if ver >= 17:
+        r.u8()
+    if ver < _FIRST_V4:
+        # SketchUp 3 writes no layer count: the layer records simply run
+        # until the definition-list anchor, which the loop below already
+        # stops at (a back-ref, not a layer record).
+        layer_count = 1 << 30
+    else:
+        layer_count = r.u32()
+    if layer_count > 100000 and ver >= _FIRST_V4:
+        raise LegacyParseError("implausible layer count")
+    # ``layer_count`` counts REAL layers. SketchUp 2020 interleaves a null
+    # object-ref after each layer record (a separator, not a layer), so
+    # counting reads walks off mid-list on files with several layers; count
+    # parsed layers instead, skip the separators, and stop early if the
+    # next tag is a back-ref (the definition-list anchor) — a v20 variant
+    # where the count over-includes separators.
+    layers = []
+    while len(layers) < layer_count:
+        tag = r.peek_u16()
+        if tag == 0:
+            r.pos += 2
+            continue
+        if tag != 0xFFFF and not (tag & 0x8000):
+            break
+        s, _, v = ar.read_object(r, expect='CLayer')
+        if v is None:
+            continue
+        layers.append((s, v))
+    # trailing separators (and any layer records past the declared count)
+    ar._collect_trailing_layers(r, layers_out=layers)
+
+    # definition list: object pointer to the ACTIVE layer, then count
+    _, dn, _ = ar.read_object(r)
+    if dn != 'CLayer':
+        raise LegacyParseError(f"definition-list anchor is {dn}, not a layer")
+    def_count = r.u32()
+    if def_count > 1_000_000:
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, 1_000_000, ar)
+        if retry is not None:
+            def_count = retry
+            if not _definition_starts_at(ar, r.pos):
+                # A model with NO component definitions has no definition
+                # count to find: SketchUp 2020 writes its filler where the
+                # count would be, and the first count behind it is the ROOT
+                # entity count. The retry cannot tell the two apart, so it
+                # handed the root count over as a definition count - and the
+                # root entities were then read (and silently dropped) as
+                # "definitions". A real definition count is always followed
+                # by a definition record; anything else means this is the
+                # root count, so put it back.
+                def_count = 0
+                r.pos -= 4
+        else:
+            # No count behind the filler at all: an entirely empty model,
+            # whose root count is 0 (the retry only accepts counts > 0).
+            root_count_at = _v20_filler_before_empty_root(r.data, r.pos - 4)
+            if root_count_at is not None:
+                def_count = 0
+                r.pos = root_count_at
+    if def_count > 1_000_000:
+        raise LegacyParseError("implausible definition count")
+    for _ in range(def_count):
+        ar.read_object(r, expect='CComponentDefinition')
+
+    # trailing definitions, back-to-back
+    def_cls = ar.class_slot.get('CComponentDefinition')
+    while True:
+        tag = r.peek_u16()
+        is_def = def_cls is not None and tag == (0x8000 | def_cls)
+        if not is_def and tag == 0xFFFF \
+                and r.peek(26)[6:26] == b'CComponentDefinition':
+            is_def = True
+        if not is_def:
+            break
+        ar.read_object(r)
+
+    # root entity list
+    root_count = r.u32()
+    if root_count > 5_000_000:
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, 5_000_000, ar)
+        if retry is not None:
+            root_count = retry
+    if root_count > 5_000_000:
+        raise LegacyParseError("implausible root entity count")
+    root = _read_entity_list(ar, r, root_count, 'root')
+
+    return ar, root, layers, materials
+
+
+# ── legacy dynamic-component properties ─────────────────────────────────
+
+# SketchUp's Dynamic Components extension stores its data in an attribute
+# dictionary literally named "dynamic_attributes" - a stable, publicly
+# documented part of the SketchUp Ruby API
+# (Entity#attribute_dictionary("dynamic_attributes")). The legacy walker
+# already fully decodes an entity's CAttributeContainer into typed
+# (dict-name, {key: value}) pairs via _read_attr_container/_read_attr_named
+# for other purposes (CFaceTextureCoords lookup) - this just looks up that
+# one dictionary by name, mirroring what the VFF path's
+# _core.extract_dynamic_properties() does for D007/DC05 TLV data.
+_DYNAMIC_ATTRIBUTES_DICT_NAME = 'dynamic_attributes'
+
+
+def _stringify_attr_value(value):
+    """Render an already-typed legacy attribute value (int, float, str,
+    list, 3-tuple, or None) as a string, matching the string-valued
+    Dict[str, str] contract the VFF path's extract_dynamic_properties()
+    produces."""
+    if value is None:
+        return ''
+    if isinstance(value, (list, tuple)):
+        return ','.join(_stringify_attr_value(v) for v in value)
+    return str(value)
+
+
+def _extract_legacy_attribute_dictionaries(attrs):
+    """Extract EVERY attribute dictionary attached to a legacy entity's
+    already-parsed CAttributeContainer, keyed by the dictionary's own
+    declared name - not just the one named _DYNAMIC_ATTRIBUTES_DICT_NAME
+    (openskp#254). Real entities routinely carry several at once (a
+    SketchUp extension's own dictionary alongside SketchUp's own
+    'dynamic_attributes' one, or several of the extension's own, e.g.
+    FrameBuilder's 'fbd-einfo'/'fbd-profile'/'fbd-profile-cords') -
+    filtering down to one hardcoded name silently discarded the rest.
+    Values keep their real, already-typed shape (int/float/str/None/a
+    3-tuple/a possibly-nested list) - see _stringify_attr_value for the
+    separate, backward-compatible stringified view. Returns {} when the
+    entity carries no attribute container at all."""
+    if not isinstance(attrs, dict):
+        return {}
+    out = {}
+    for _class_name, value in attrs.get('children', []):
+        # _class_name is the entity class name (always 'CAttributeNamed'
+        # here, from ar.read_object) - the dictionary's own declared name
+        # lives inside the value, as value['name'].
+        if not isinstance(value, dict):
+            continue
+        name = value.get('name')
+        if not name:
+            continue
+        out[name] = dict(value.get('entries', {}))
+    return out
+
+
+# ── adapter to the full_parse dict shape ────────────────────────────────
+
+class _Builder:
+    """Mirror of ``_core._GeometryBuilder`` (kept dependency-free)."""
+
+    def __init__(self):
+        self.vertices = {}
+        self.edges = {}
+        self.edge_flags = {}      # edge id -> display flag byte (VFF D307 bits)
+        # edge slot -> raw layer id, mirroring
+        # _core._GeometryBuilder.edge_layers. The legacy drawbase already
+        # carries 'layer' (it is where face['layer'] comes from), it just was
+        # never captured for edges - so a curve-only model, which has no
+        # faces, had no layer information anywhere.
+        self.edge_layers = {}
+        # edge slot -> parent Curve's slot index,
+        # mirroring _core._GeometryBuilder.edge_curves (VFF's BB0B). Both
+        # parsers carry this; neither stored it. Absent = the edge is not in
+        # a curve (SketchUp's ``edge.curve == nil``).
+        self.edge_curves = {}
+        # Curve slot -> decoded arc frame, for the
+        # subset of Curves that are CArcCurve. Keyed by the same slot index
+        # that edge_curves stores, so an edge's analytic arc (if any) is one
+        # lookup away. The VFF parser has no counterpart: its arc-curve
+        # payload (skppy's ARC_SPECIFIC_PAYLOAD 0x4C2D) is not decoded here,
+        # and none of the 15 real models in the test corpus contains an
+        # ARC_CURVES section at all (checked structurally, see README).
+        self.arc_curves = {}
+        self.faces = {}
+        self.instances = []
+        self.section_planes = []
+        self.texts = []
+        self.dimensions = []
+        self.construction_lines = []
+        self.construction_points = []
+
+
+def _fill_builder(builder, ents, slots):
+    for s, n, v in ents:
+        if not isinstance(v, dict):
+            continue
+        k = v.get('k')
+        if k == 'edge':
+            _add_edge(builder, s, v, slots)
+        elif k == 'arccurve':
+            # Keep the analytic arc. Edges point at
+            # this slot through edge_curves; without this the frame decoded in
+            # _read_arccurve would die here, one line later.
+            builder.arc_curves[s] = v['params']
+        elif k == 'face':
+            loops = []
+            for lp in v['loops']:
+                loop = []
+                for u in lp['uses']:
+                    es = u['edge']
+                    ent = slots.get(es)
+                    if ent is None or ent[2] is None:
+                        continue
+                    _add_edge(builder, es, ent[2], slots)
+                    # Normalize to the documented CoEdge contract (+1 = same
+                    # direction as the edge, -1 = reversed) - u['sense'] is
+                    # the raw SketchUp bit (0 = forward, 1 = reversed).
+                    loop.append((es, -1 if u['sense'] else 1))
+                loops.append(loop)
+            face = {'loops': loops, 'normal': tuple(v['plane'][:3]),
+                    'material_id': v['db']['mat'] or None,
+                    'back_material_id': v['back_mat'] or None,
+                    'hidden': bool(v['db']['hidden']),
+                    # drawbase already carries the
+                    # face's layer id, but it was dropped here - so downstream
+                    # (scene.py -> MeshMetadata.layer -> export/ifc.py's
+                    # classifier) saw the inherited default for every face and
+                    # semantic typing could never fire on layer names.
+                    'layer': v['db'].get('layer')}
+            attrs = v.get('attrs')
+            if isinstance(attrs, dict):
+                for cn, cv in attrs.get('children', []):
+                    if isinstance(cv, dict) and cv.get('k') == 'ftc':
+                        face['uv_transform'] = list(cv['front'])
+                        face['uv_transform_back'] = list(cv['back'])
+                        face['uv_projected'] = cv.get('front_projected', False)
+                        face['uv_projected_back'] = cv.get('back_projected', False)
+            builder.faces[s] = face
+        elif k == 'instance':
+            attr_dicts = _extract_legacy_attribute_dictionaries(v.get('attrs'))
+            dynamic = attr_dicts.get(_DYNAMIC_ATTRIBUTES_DICT_NAME, {})
+            builder.instances.append({
+                'name': v['name'], 'ref_idx': v['def'],
+                'ref_guid': '', 'matrix': list(v['xf']),
+                'material_id': v['db']['mat'] or None,
+                'layer_id': v['db']['layer'] or None,
+                'hidden': bool(v['db']['hidden']),
+                'children': [],
+                'attribute_dictionaries': attr_dicts,
+                # Backward-compatible view: the one dictionary SketchUp's
+                # own Dynamic Components extension uses, stringified (or
+                # {} if this entity carries no dictionary by that exact
+                # name) - matching this field's pre-existing contract.
+                'properties': {dk: _stringify_attr_value(dv) for dk, dv in dynamic.items()}})
+        elif k == 'image':
+            # Placed exactly like an ordinary component instance - same
+            # transform/definition-reference shape - the only difference is
+            # the definition it points at is flagged is_image=True (set
+            # above via image_def_ids), matching how the VFF/modern reader
+            # already treats an Image entity as "a component placed through
+            # the same instance machinery as any other". Previously dropped
+            # here entirely: this dict's 'k' matched none of the branches
+            # above, so an Image entity parsed without error but never
+            # appeared anywhere a caller could see it.
+            builder.instances.append({
+                'name': '', 'ref_idx': v['def'],
+                'ref_guid': v.get('guid', ''), 'matrix': list(v['xform']),
+                'material_id': v['db']['mat'] or None,
+                'layer_id': v['db']['layer'] or None,
+                'hidden': bool(v['db']['hidden']),
+                'children': [], 'properties': {}})
+        elif k == 'sectionplane':
+            builder.section_planes.append({
+                'plane': v.get('plane', [0.0, 0.0, 1.0, 0.0]),
+                'name': v.get('name', ''),
+                'label': v.get('label', ''),
+                'hidden': bool(v.get('db', {}).get('hidden', False))
+            })
+        elif k == 'text':
+            builder.texts.append({
+                'text': v.get('text', ''),
+                'hidden': bool(v.get('db', {}).get('hidden', False)),
+                'p': v.get('p'),
+                'lp': v.get('lp'),
+            })
+        elif k == 'dimension':
+            dim = {
+                'text': v.get('text', ''),
+                'hidden': bool(v.get('db', {}).get('hidden', False)),
+                'offset': v.get('offset', 0.0),
+            }
+            # endpoints: FREE connections carry them inline; anchored ones
+            # resolve to their vertices (inches)
+            pts = [v.get('a'), v.get('b')]
+            for i, cs in enumerate(v.get('connect', ())[:2]):
+                if pts[i] is not None:
+                    continue
+                ent = slots.get(cs) if cs is not None else None
+                val = ent[2] if ent and ent[0] == 'obj' else None
+                if isinstance(val, dict) and 'xyz' in val:
+                    pts[i] = tuple(val['xyz'])
+            if len(pts) == 2 and pts[0] and pts[1]:
+                dim['a'], dim['b'] = pts[0], pts[1]
+            builder.dimensions.append(dim)
+        elif k == 'cline':
+            builder.construction_lines.append({
+                'point': v.get('point', (0.0, 0.0, 0.0)),
+                'direction': v.get('direction', (1.0, 0.0, 0.0)),
+                'start': v.get('start'),
+                'end': v.get('end'),
+            })
+        elif k == 'cpoint':
+            builder.construction_points.append({
+                'position': v.get('pos', (0.0, 0.0, 0.0)),
+            })
+
+
+def _add_edge(builder, slot, e, slots):
+    if slot in builder.edges:
+        return
+    v1, v2 = e['v1'], e['v2']
+    for vs in (v1, v2):
+        ent = slots.get(vs)
+        if ent is not None and ent[2] is not None and vs not in builder.vertices:
+            builder.vertices[vs] = tuple(ent[2]['xyz'])
+    builder.edges[slot] = (v1, v2)
+    db = e.get('db') or {}
+    flags = ((0x08 if db.get('soft') else 0)
+             | (0x10 if db.get('smooth') else 0)
+             | (0x01 if db.get('hidden') else 0))
+    if flags:
+        builder.edge_flags[slot] = flags
+    # The edge's own layer, from the same drawbase
+    # face['layer'] comes from. See _GeometryBuilder.edge_layers.
+    edge_layer = db.get('layer')
+    if edge_layer:
+        builder.edge_layers[slot] = edge_layer
+    # The edge's parent Curve. _read_edge has
+    # always returned this ('curve': the CCurve/CArcCurve slot index) and
+    # _add_edge has always received it - it was simply never stored, so the
+    # only remaining trace of SketchUp's own curve grouping was dropped
+    # here. The VFF parser reads the same thing as BB0B (Edge#curve); see
+    # _GeometryBuilder.edge_curves.
+    curve = e.get('curve')
+    if curve is not None:
+        builder.edge_curves[slot] = curve
+
+    # If that Curve is an analytic arc, keep the
+    # frame. It arrives on the edge that first referenced the CArcCurve
+    # (see _read_edge); every later edge on the same arc back-refs it and
+    # contributes nothing new here.
+    cv = e.get('curve_value')
+    if curve is not None and isinstance(cv, dict) and cv.get('k') == 'arccurve':
+        builder.arc_curves[curve] = cv['params']
+
+
+def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
+    """Parse a classic MFC ``.skp`` into the ``full_parse`` dict shape."""
+    t0 = time.monotonic()
+    with open(skp_path, 'rb') as f:
+        data = f.read()
+    logger.info("Parsing legacy %s (%d bytes)", skp_path, len(data))
+
+    version = 'unknown'
+    second = data.find(_STR_MARKER, 4)
+    if second > 0:
+        text = data[second + 4:second + 100].decode('utf-16-le', errors='ignore')
+        if '{' in text and '}' in text:
+            version = text[text.find('{'):text.find('}') + 1]
+    logger.debug("Detected legacy version %s", version)
+
+    try:
+        ar, root, layers, materials = _walk(data)
+    except (LegacyParseError, struct.error, IndexError, UnicodeDecodeError) as e:
+        raise SkpParseError(
+            f"legacy .skp parse failed: {e}", stage="legacy_walk") from e
+    logger.debug(
+        "Legacy walk complete: %d materials, %d layers", len(materials), len(layers))
+
+    slots = ar.slots
+
+    # Definitions an Image entity (CImage) places - a legacy file encodes
+    # "this definition is an Image" purely by which KIND of entity places
+    # it (CImage vs CComponentInstance/CGroup), not by a byte on the
+    # definition itself (unlike the VFF path's 8315 kind-byte sub-tag).
+    # Scanned before the definitions loop below so is_image can be set
+    # correctly the first time a definition is built, matching the VFF
+    # reader's Definition.is_image field.
+    image_def_ids = {
+        ent[2]['def'] for ent in slots.values()
+        if ent[0] == 'obj' and ent[1] == 'CImage' and ent[2]
+    }
+
+    # materials — keyed by name like the VFF path
+    mats: Dict[str, Any] = {}
+    material_id_to_name: Dict[int, str] = {}
+    for s, v in materials:
+        rgba = v.get('rgba', (128, 128, 128, 255))
+        # the stored f64 is a TRANSPARENCY (0 = opaque), gated by the
+        # trailing use-flag byte; expose opacity like the VFF path
+        if v.get('use_opacity'):
+            trans = min(max(1.0 - v['opacity'], 0.0), 1.0)
+        else:
+            trans = 1.0
+        colorized = v.get('colorized', False)
+        mat_obj: Dict[str, Any] = {
+            'name': v['name'],
+            'color': {'r': rgba[0], 'g': rgba[1], 'b': rgba[2], 'a': rgba[3]},
+            'transparency': trans,
+            'colorized': colorized, 'colorize_type': v.get('colorize_type', 0),
+        }
+        if 'tex_dib' in v:
+            dib = slots.get(v['tex_dib']) if v['tex_dib'] is not None else None
+            tex_data = dib[2]['data'] if dib and dib[2] else v.get('tex_data')
+            ext = '.png' if (tex_data or b'')[:4] == b'\x89PNG' else '.jpg'
+            fname = v.get('tex_file') or (v['name'] + ext)
+            mat_obj['texture'] = {'filename': fname,
+                                  'x_scale': v['tex_w'], 'y_scale': v['tex_h'],
+                                  'data': tex_data}
+        mats[v['name']] = mat_obj
+        material_id_to_name[s] = v['name']
+
+    # layers
+    layer_colors = {}
+    layer_hidden = {}
+    layer_id_to_name = {}
+    for s, v in layers:
+        rgba = v.get('rgba', (136, 136, 136, 255))
+        layer_colors[v['name']] = (rgba[0], rgba[1], rgba[2])
+        layer_hidden[v['name']] = bool(v.get('hidden', 0))
+        layer_id_to_name[s] = v['name']
+    if 'Layer0' not in layer_colors:
+        layer_colors['Layer0'] = (136, 136, 136)
+    if 'Layer0' not in layer_hidden:
+        layer_hidden['Layer0'] = False
+
+    # definitions
+    defs_dict: Dict[Any, Any] = {}
+    processed = 0
+    try:
+        for s, ent in slots.items():
+            if ent[0] == 'obj' and ent[1] == 'CComponentDefinition' and ent[2]:
+                d = ent[2]
+                b = _Builder()
+                _fill_builder(b, d['ents'], slots)
+                defs_dict[s] = {'guid': d['guid'], 'name': d['name'],
+                                'is_image': s in image_def_ids,
+                                'is_group': d.get('is_group', False),
+                                'always_faces_camera': d.get('faces_camera', False),
+                                'shadows_face_sun': d.get('shadows_face_sun', False),
+                                'builder': b}
+                processed += 1
+                if processed % _PROGRESS_INTERVAL == 0:
+                    logger.debug("Processed %d component definitions", processed)
+    except Exception as e:
+        raise SkpParseError(
+            f"Failed while building component definitions: {e}",
+            stage="legacy_defs", definition_id=s,
+        ) from e
+
+    root_builder = _Builder()
+    _fill_builder(root_builder, root, slots)
+    defs_dict['ROOT'] = {'guid': 'ROOT', 'name': 'ROOT_MODEL',
+                         'builder': root_builder}
+
+    try:
+        pages = _read_page_list(data, ar)
+        if pages is None:
+            pages = _scan_pages(data, ar)
+    except (LegacyParseError, struct.error, IndexError, ValueError):
+        pages = []
+
+    logger.info(
+        "Parse complete: %s (%d defs, %.2fs)",
+        skp_path, len(defs_dict), time.monotonic() - t0,
+    )
+
+    return {
+        'version': version,
+        'dimensions': [d for d in root_builder.dimensions
+                       if d.get('a') and d.get('b')],
+        'layer_colors': layer_colors,
+        'layer_hidden': layer_hidden,
+        'layer_id_to_name': layer_id_to_name,
+        'material_id_to_name': material_id_to_name,
+        'materials': mats,
+        'materials_by_folder': {},
+        'defs_dict': defs_dict,
+        'elements': [],
+        'pages': pages,
+        'thumbnail_data': None,
+        'styles': [],
+        # Legacy (pre-2021 MFC) files carry no meta/meta.dat container -
+        # that's a VFF/ZIP-only construct - so there is no known source
+        # for the model's unit-system string here.
+        'units': None,
+    }
